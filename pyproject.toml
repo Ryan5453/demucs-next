@@ -15,9 +15,9 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "julius>=0.2.7",
     "numpy>=2.0.0",
     "torch>=2.9.0",
+    "torchaudio>=2.9.0",
     "torchcodec>=0.8.1",
     "typer>=0.19.1",
     "httpx>=0.28.1"

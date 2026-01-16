@@ -4,8 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-import julius
 import torch
+import torchaudio
 from torch import Tensor
 
 from .exceptions import ValidationError
@@ -42,7 +42,7 @@ def convert_audio_channels(wav, channels=2):
 def convert_audio(wav, from_samplerate, to_samplerate, channels) -> Tensor:
     """Convert audio from a given samplerate to a target one and target number of channels."""
     wav = convert_audio_channels(wav, channels)
-    return julius.resample_frac(wav, from_samplerate, to_samplerate)
+    return torchaudio.functional.resample(wav, from_samplerate, to_samplerate)
 
 
 def prevent_clip(audio: Tensor, mode: str | None = "rescale") -> Tensor:
