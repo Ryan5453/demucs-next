@@ -318,7 +318,7 @@ class Separator:
         ref = wav.mean(0)
         mean = ref.mean()
         std = ref.std()
-        ref = (ref - mean) / (1e-5 + std)
+        wav = (wav - mean) / (1e-5 + std)
 
         sources_tensor = apply_model(
             self.model,
