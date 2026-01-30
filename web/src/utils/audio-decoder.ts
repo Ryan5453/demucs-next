@@ -31,6 +31,8 @@ const FFMPEG_CDN_BASE = `https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@${FFMPEG_C
 export interface DecodeResult {
     buffer: AudioBuffer;
     artwork: string | null; // Blob URL to artwork image, or null if none
+    title: string | null; // Song title from metadata, or null if none
+    artist: string | null; // Artist from metadata, or null if none
     usedFallback: 'mediabunny' | 'ffmpeg';
 }
 
@@ -144,13 +146,65 @@ async function extractArtworkWithFFmpeg(
 }
 
 /**
+ * Extract metadata (title, artist) from audio file using ffmpeg
+ */
+async function extractMetadataWithFFmpeg(
+    ffmpeg: FFmpeg,
+    inputName: string
+): Promise<{ title: string | null; artist: string | null }> {
+    try {
+        const metadataName = 'metadata.txt';
+
+        // Extract metadata to ffmetadata format
+        await ffmpeg.exec([
+            '-i', inputName,
+            '-f', 'ffmetadata',
+            metadataName
+        ]);
+
+        // Read metadata file
+        try {
+            const metadataBytes = await ffmpeg.readFile(metadataName) as Uint8Array;
+            const metadataText = new TextDecoder().decode(metadataBytes);
+            await ffmpeg.deleteFile(metadataName);
+
+            // Parse ffmetadata format (key=value lines)
+            let title: string | null = null;
+            let artist: string | null = null;
+
+            for (const line of metadataText.split('\n')) {
+                const [key, ...valueParts] = line.split('=');
+                const value = valueParts.join('=').trim();
+                
+                if (key?.toLowerCase() === 'title' && value) {
+                    title = value;
+                    console.log('Extracted title from ffmpeg:', title);
+                }
+                if (key?.toLowerCase() === 'artist' && value) {
+                    artist = value;
+                    console.log('Extracted artist from ffmpeg:', artist);
+                }
+            }
+
+            return { title, artist };
+        } catch {
+            // No metadata file
+            return { title: null, artist: null };
+        }
+    } catch {
+        // Metadata extraction failed
+        return { title: null, artist: null };
+    }
+}
+
+/**
  * Decode audio using ffmpeg.wasm (last resort for exotic codecs)
  */
 async function decodeWithFFmpeg(
     arrayBuffer: ArrayBuffer,
     fileName: string,
     targetSampleRate: number
-): Promise<{ buffer: AudioBuffer; artwork: string | null }> {
+): Promise<{ buffer: AudioBuffer; artwork: string | null; title: string | null; artist: string | null }> {
     console.log('Loading ffmpeg.wasm for decoding...');
     const ffmpeg = await loadFFmpeg();
 
@@ -160,6 +214,9 @@ async function decodeWithFFmpeg(
 
     // Extract artwork first (before modifying the file)
     const artwork = await extractArtworkWithFFmpeg(ffmpeg, inputName);
+
+    // Extract metadata (title, artist)
+    const { title, artist } = await extractMetadataWithFFmpeg(ffmpeg, inputName);
 
     // Convert to WAV format (universally decodable)
     const outputName = 'output.wav';
@@ -185,7 +242,7 @@ async function decodeWithFFmpeg(
     const buffer = await audioContext.decodeAudioData(wavBuffer);
     await audioContext.close();
 
-    return { buffer, artwork };
+    return { buffer, artwork, title, artist };
 }
 
 /**
@@ -194,15 +251,17 @@ async function decodeWithFFmpeg(
 async function decodeWithMediabunny(
     arrayBuffer: ArrayBuffer,
     targetSampleRate: number
-): Promise<{ buffer: AudioBuffer; artwork: string | null }> {
+): Promise<{ buffer: AudioBuffer; artwork: string | null; title: string | null; artist: string | null }> {
     // Create input from array buffer
     const input = new Input({
         formats: ALL_FORMATS,
         source: new BufferSource(arrayBuffer),
     });
 
-    // Extract artwork from metadata
+    // Extract artwork and metadata from tags
     let artwork: string | null = null;
+    let title: string | null = null;
+    let artist: string | null = null;
     try {
         const tags = await input.getMetadataTags();
         if (tags.images && tags.images.length > 0) {
@@ -210,6 +269,15 @@ async function decodeWithMediabunny(
             const blob = new Blob([new Uint8Array(image.data)], { type: image.mimeType || 'image/jpeg' });
             artwork = URL.createObjectURL(blob);
             console.log('Extracted artwork from audio file');
+        }
+        // Extract title and artist
+        if (tags.title) {
+            title = tags.title;
+            console.log('Extracted title:', title);
+        }
+        if (tags.artist) {
+            artist = tags.artist;
+            console.log('Extracted artist:', artist);
         }
     } catch (e) {
         console.log('Could not extract metadata tags:', e);
@@ -282,10 +350,10 @@ async function decodeWithMediabunny(
         source.connect(offlineCtx.destination);
         source.start();
         const resampledBuffer = await offlineCtx.startRendering();
-        return { buffer: resampledBuffer, artwork };
+        return { buffer: resampledBuffer, artwork, title, artist };
     }
 
-    return { buffer, artwork };
+    return { buffer, artwork, title, artist };
 }
 
 /**
@@ -300,9 +368,9 @@ export async function decodeAudioFile(
     // Tier 1: Try Mediabunny first (handles most formats via WebCodecs)
     try {
         console.log('Attempting to decode with Mediabunny...');
-        const { buffer, artwork } = await decodeWithMediabunny(arrayBuffer, audioContext.sampleRate);
+        const { buffer, artwork, title, artist } = await decodeWithMediabunny(arrayBuffer, audioContext.sampleRate);
         console.log('Successfully decoded with Mediabunny');
-        return { buffer, artwork, usedFallback: 'mediabunny' };
+        return { buffer, artwork, title, artist, usedFallback: 'mediabunny' };
     } catch (mediabunnyError) {
         console.log('Mediabunny decode failed, trying ffmpeg.wasm:', mediabunnyError);
     }
@@ -310,9 +378,9 @@ export async function decodeAudioFile(
     // Tier 2: Try ffmpeg.wasm (handles exotic codecs like ALAC, WMA, etc)
     try {
         console.log('Attempting to decode with ffmpeg.wasm...');
-        const { buffer, artwork } = await decodeWithFFmpeg(arrayBuffer, file.name, audioContext.sampleRate);
+        const { buffer, artwork, title, artist } = await decodeWithFFmpeg(arrayBuffer, file.name, audioContext.sampleRate);
         console.log('Successfully decoded with ffmpeg.wasm');
-        return { buffer, artwork, usedFallback: 'ffmpeg' };
+        return { buffer, artwork, title, artist, usedFallback: 'ffmpeg' };
     } catch (ffmpegError) {
         console.error('All decode methods failed:', ffmpegError);
         throw new Error(

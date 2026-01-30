@@ -27,6 +27,9 @@ export function useDemucs() {
     const [stemUrls, setStemUrls] = useState<Record<string, string>>({});
     // Store artwork URL (album art from audio file)
     const [artworkUrl, setArtworkUrl] = useState<string | null>(null);
+    // Store track metadata from audio file
+    const [trackTitle, setTrackTitle] = useState<string | null>(null);
+    const [trackArtist, setTrackArtist] = useState<string | null>(null);
     // Store waveform data for visualization (array of 0-100 values)
     const [stemWaveforms, setStemWaveforms] = useState<Record<string, number[]>>({});
 
@@ -52,14 +55,15 @@ export function useDemucs() {
         return audioContextRef.current;
     }, []);
 
-    const loadModel = useCallback(async (model: ModelType) => {
+    const loadModel = useCallback(async (model: ModelType, backend: 'webgpu' | 'wasm' = 'webgpu') => {
         setState(prev => ({ ...prev, modelLoading: true }));
-        const result = await loadOnnxModel(model, addLog);
+        const result = await loadOnnxModel(model, addLog, backend);
         setState(prev => ({
             ...prev,
             modelLoading: false,
             modelLoaded: result.success,
         }));
+        return result.success;
     }, [addLog]);
 
     const unloadModel = useCallback(async () => {
@@ -78,7 +82,7 @@ export function useDemucs() {
             addLog(`Loading audio: ${file.name}`, 'info');
             const ctx = getAudioContext();
 
-            const { buffer: audioBuffer, artwork, usedFallback } = await decodeAudioFile(file, ctx);
+            const { buffer: audioBuffer, artwork, title, artist, usedFallback } = await decodeAudioFile(file, ctx);
 
             if (usedFallback === 'ffmpeg') {
                 addLog('Audio decoded using fallback decoder (ffmpeg.wasm)', 'info');
@@ -90,6 +94,16 @@ export function useDemucs() {
             if (artwork) {
                 setArtworkUrl(artwork);
                 addLog('Album artwork extracted', 'info');
+            }
+
+            // Store track metadata if present
+            if (title) {
+                setTrackTitle(title);
+                addLog(`Track title: ${title}`, 'info');
+            }
+            if (artist) {
+                setTrackArtist(artist);
+                addLog(`Artist: ${artist}`, 'info');
             }
 
             addLog('Audio loaded successfully.', 'success');
@@ -107,10 +121,14 @@ export function useDemucs() {
         }
     }, [addLog, getAudioContext]);
 
-    const separateAudio = useCallback(async () => {
+    const separateAudio = useCallback(async (skipModelCheck = false) => {
         // Check if model is loaded (either main thread session or worker)
-        if (!state.modelLoaded || !state.audioBuffer) {
-            addLog('Model or audio not loaded', 'error');
+        if (!skipModelCheck && !state.modelLoaded) {
+            addLog('Model not loaded', 'error');
+            return;
+        }
+        if (!state.audioBuffer) {
+            addLog('Audio not loaded', 'error');
             return;
         }
 
@@ -337,7 +355,7 @@ export function useDemucs() {
             setStatus('Error during separation');
             setState(prev => ({ ...prev, separating: false }));
         }
-    }, [state.audioBuffer, addLog, setStatus, setProgress]);
+    }, [state.modelLoaded, state.audioBuffer, addLog, setStatus, setProgress]);
 
     const resetForNewTrack = useCallback(() => {
         // Revoke old blob URLs to prevent memory leaks
@@ -358,6 +376,8 @@ export function useDemucs() {
         setStemUrls({});
         setStemWaveforms({});
         setArtworkUrl(null);
+        setTrackTitle(null);
+        setTrackArtist(null);
         setAudioError(null);
     }, [stemUrls, artworkUrl]);
 
@@ -366,6 +386,8 @@ export function useDemucs() {
         stemUrls,
         stemWaveforms,
         artworkUrl,
+        trackTitle,
+        trackArtist,
         audioError,
         loadModel,
         unloadModel,

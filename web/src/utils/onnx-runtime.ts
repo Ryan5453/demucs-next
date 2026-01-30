@@ -79,7 +79,8 @@ export interface ModelLoadResult {
 
 export async function loadModel(
     model: ModelType,
-    addLog: (message: string, type: LogEntry['type']) => void
+    addLog: (message: string, type: LogEntry['type']) => void,
+    preferredBackend: 'webgpu' | 'wasm' = 'webgpu'
 ): Promise<ModelLoadResult> {
     try {
         addLog(`Starting model load: ${model}...`, 'info');
@@ -92,11 +93,15 @@ export async function loadModel(
         // HDemucs (v3) uses bidirectional LSTMs which aren't supported on WebGPU
         // So we must use WASM-only for that model
         const requiresWasmOnly = model === 'hdemucs_mmi';
-        const useWebGPU = hasWebGPU && !requiresWasmOnly;
+        
+        // Use WebGPU only if: user prefers it, it's available, and model supports it
+        const useWebGPU = preferredBackend === 'webgpu' && hasWebGPU && !requiresWasmOnly;
 
         const modelUrl = MODEL_URLS[model];
 
+        console.log('[ONNX] Preferred backend:', preferredBackend);
         console.log('[ONNX] WebGPU available:', hasWebGPU);
+        console.log('[ONNX] Model requires WASM only:', requiresWasmOnly);
         console.log('[ONNX] Using WebGPU:', useWebGPU);
         console.log('[ONNX] Model URL:', modelUrl);
 

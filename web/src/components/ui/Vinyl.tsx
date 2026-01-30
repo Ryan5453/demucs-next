@@ -1,80 +1,205 @@
-import React from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 
-interface VinylProps {
+interface GoldVinylProps {
     className?: string;
-    style?: React.CSSProperties;
-    progress?: number; // 0 to 100, if provided renders the progress ring
-    variant?: 'terracotta' | 'cyan';
-    animate?: boolean;
+    progress?: number;
+    spinning?: boolean;
     artworkUrl?: string | null;
 }
 
-export const Vinyl: React.FC<VinylProps> = ({
+export const Vinyl: React.FC<GoldVinylProps> = ({
     className = '',
-    style = {},
     progress,
-    variant = 'terracotta',
-    animate = true,
+    spinning = false,
     artworkUrl
 }) => {
-    const labelGradient = variant === 'terracotta'
-        ? 'from-terracotta-400 via-terracotta-500 to-terracotta-700'
-        : 'from-cyan-400 via-cyan-500 to-cyan-700';
-
-    const spindleColor = variant === 'terracotta' ? 'bg-brown-900' : 'bg-slate-900';
-    const spindleSize = variant === 'terracotta' ? 'w-3 h-3' : 'w-2 h-2'; // Matching the slight diff in original
-
-    // If showing progress ring, we need space for it (inset-3), otherwise full size (inset-0)
-    const vinylInset = progress !== undefined ? 'inset-3' : 'inset-0';
-
+    const circumference = 2 * Math.PI * 130;
+    
     return (
-        <div className={`relative ${className}`} style={style}>
-            {/* Progress ring - only if progress is defined */}
+        <div className={`gold-vinyl-container ${className}`}>
+            {/* Progress ring */}
             {progress !== undefined && (
-                <svg className="absolute inset-0 w-full h-full" viewBox="0 0 208 208">
-                    <circle cx="104" cy="104" r="96" fill="none" stroke="#334155" strokeWidth="10" opacity="0.5" />
-                    <circle
-                        cx="104" cy="104" r="96"
-                        fill="none" stroke="#06B6D4" strokeWidth="10"
-                        strokeLinecap="round"
-                        strokeDasharray="603"
-                        strokeDashoffset={603 - (603 * progress / 100)}
-                        transform="rotate(-90 104 104)"
-                    />
-                </svg>
+                <div className="vinyl-progress-ring">
+                    <svg viewBox="0 0 280 280">
+                        <circle
+                            cx="140"
+                            cy="140"
+                            r="130"
+                            className="vinyl-progress-track"
+                        />
+                        <circle
+                            cx="140"
+                            cy="140"
+                            r="130"
+                            className="vinyl-progress-fill"
+                            strokeDasharray={circumference}
+                            strokeDashoffset={circumference - (circumference * progress / 100)}
+                        />
+                    </svg>
+                </div>
             )}
 
-            {/* Vinyl record */}
-            <div
-                className={`absolute ${vinylInset} rounded-full vinyl vinyl-rim`}
-                style={{ animation: animate ? 'vinyl-spin 3s linear infinite' : 'none' }}
-            >
-                <div className="absolute inset-0 rounded-full vinyl-shine" />
-                <div className="absolute inset-[12%] border border-[#2a2a2a] rounded-full" />
-                <div className="absolute inset-[20%] border border-[#333] rounded-full" />
-                <div className="absolute inset-[28%] border border-[#2a2a2a] rounded-full" />
-                <div className="absolute inset-[36%] border border-[#333] rounded-full" />
+            {/* The gold record */}
+            <div className={`gold-vinyl ${spinning ? 'spinning' : ''}`}>
+                {/* Groove rings */}
+                <div className="gold-vinyl-grooves" />
+                
+                {/* Center label */}
+                <div className="gold-vinyl-label">
+                    {artworkUrl ? (
+                        <img src={artworkUrl} alt="Album art" />
+                    ) : (
+                        <div className="gold-vinyl-label-text">demucs</div>
+                    )}
+                    <div className="gold-vinyl-spindle" />
+                </div>
+            </div>
+        </div>
+    );
+};
 
-                {/* Center Label - artwork or gradient fallback */}
-                {artworkUrl ? (
-                    <div
-                        className="absolute inset-[38%] rounded-full flex items-center justify-center overflow-hidden"
-                        style={{ boxShadow: 'inset 0 2px 8px rgba(0,0,0,0.3), inset 0 -1px 4px rgba(255,255,255,0.1)' }}
-                    >
-                        <img
-                            src={artworkUrl}
-                            alt="Album artwork"
-                            className="absolute inset-0 w-full h-full object-cover"
+interface ChannelStripProps {
+    name: string;
+    color: string;
+    colorRgb: string;
+    volume: number;
+    isPlaying: boolean;
+    isMergeMode: boolean;
+    isSelected: boolean;
+    onVolumeChange: (value: number) => void;
+    onTogglePlay: () => void;
+    onDownload: () => void;
+    onToggleSelect: () => void;
+}
+
+export const ChannelStrip: React.FC<ChannelStripProps> = ({
+    name,
+    color,
+    colorRgb,
+    volume,
+    isPlaying,
+    isMergeMode,
+    isSelected,
+    onVolumeChange,
+    onTogglePlay,
+    onDownload,
+    onToggleSelect
+}) => {
+    const [vuLevel, setVuLevel] = useState(0);
+    const animationRef = useRef<number | null>(null);
+
+    useEffect(() => {
+        if (isPlaying) {
+            const animate = () => {
+                const base = volume * 0.8;
+                const variation = Math.random() * 20;
+                setVuLevel(Math.min(100, base + variation));
+                animationRef.current = requestAnimationFrame(animate);
+            };
+            animationRef.current = requestAnimationFrame(animate);
+        } else {
+            setVuLevel(0);
+            if (animationRef.current) {
+                cancelAnimationFrame(animationRef.current);
+            }
+        }
+        return () => {
+            if (animationRef.current) {
+                cancelAnimationFrame(animationRef.current);
+            }
+        };
+    }, [isPlaying, volume]);
+
+    const segments = 10;
+    const litSegments = Math.floor((vuLevel / 100) * segments);
+
+    const handleFaderMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+        const track = e.currentTarget;
+        const updateVolume = (clientY: number) => {
+            const rect = track.getBoundingClientRect();
+            const y = clientY - rect.top;
+            const percent = 100 - Math.max(0, Math.min(100, (y / rect.height) * 100));
+            onVolumeChange(percent);
+        };
+
+        updateVolume(e.clientY);
+
+        const handleMouseMove = (e: MouseEvent) => updateVolume(e.clientY);
+        const handleMouseUp = () => {
+            window.removeEventListener('mousemove', handleMouseMove);
+            window.removeEventListener('mouseup', handleMouseUp);
+        };
+
+        window.addEventListener('mousemove', handleMouseMove);
+        window.addEventListener('mouseup', handleMouseUp);
+    };
+
+    return (
+        <div 
+            className={`channel-strip ${isPlaying ? 'active' : ''}`}
+            style={{ '--stem-color': color, '--stem-color-rgb': colorRgb } as React.CSSProperties}
+        >
+            <div className="channel-label">{name}</div>
+
+            <div className="vu-meter">
+                <div className="vu-bar">
+                    {Array.from({ length: segments }).map((_, i) => (
+                        <div
+                            key={i}
+                            className={`vu-segment ${i < litSegments ? 'lit' : ''} ${i >= segments - 2 && i < litSegments ? 'peak' : ''}`}
                         />
-                        <div className={`${spindleSize} ${spindleColor} rounded-full shadow-inner relative z-10`} />
-                    </div>
-                ) : (
-                    <div
-                        className={`absolute inset-[38%] bg-gradient-to-br ${labelGradient} rounded-full flex items-center justify-center`}
-                        style={{ boxShadow: 'inset 0 2px 8px rgba(0,0,0,0.3), inset 0 -1px 4px rgba(255,255,255,0.1)' }}
+                    ))}
+                </div>
+                <div className="vu-bar">
+                    {Array.from({ length: segments }).map((_, i) => (
+                        <div
+                            key={i}
+                            className={`vu-segment ${i < litSegments ? 'lit' : ''} ${i >= segments - 2 && i < litSegments ? 'peak' : ''}`}
+                        />
+                    ))}
+                </div>
+            </div>
+
+            <div className="fader-track" onMouseDown={handleFaderMouseDown}>
+                <div className="fader-fill" style={{ height: `${volume}%` }} />
+                <div className="fader-knob" style={{ bottom: `calc(${volume}% - 4px)` }} />
+            </div>
+
+            <div className="flex gap-1">
+                {isMergeMode ? (
+                    <button
+                        className={`merge-checkbox ${isSelected ? 'checked' : ''}`}
+                        onClick={onToggleSelect}
                     >
-                        <div className={`${spindleSize} ${spindleColor} rounded-full shadow-inner`} />
-                    </div>
+                        {isSelected && (
+                            <svg className="w-3 h-3 text-black" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                            </svg>
+                        )}
+                    </button>
+                ) : (
+                    <>
+                        <button
+                            className={`channel-btn ${isPlaying ? 'active' : ''}`}
+                            onClick={onTogglePlay}
+                            style={isPlaying ? { background: color, borderColor: color } : undefined}
+                        >
+                            {isPlaying ? (
+                                <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" />
+                                </svg>
+                            ) : (
+                                <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M8 5v14l11-7z" />
+                                </svg>
+                            )}
+                        </button>
+                        <button className="channel-btn" onClick={onDownload}>
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" />
+                            </svg>
+                        </button>
+                    </>
                 )}
             </div>
         </div>

@@ -11,7 +11,7 @@ export interface ModelInfo {
 
 export const MODELS: ModelInfo[] = [
     { id: 'htdemucs', name: 'Demucs v4', stems: 4, sizeMB: 161, badge: 'recommended' },
-    { id: 'htdemucs_6s', name: 'Demucs v4 (6-source)', stems: 6, sizeMB: 105, badge: 'experimental' },
+    { id: 'htdemucs_6s', name: 'Demucs v4 6-stem', stems: 6, sizeMB: 105, badge: 'experimental' },
     { id: 'hdemucs_mmi', name: 'Demucs v3', stems: 4, sizeMB: 320 },
 ];
 
@@ -33,7 +33,6 @@ export function ModelPicker({
 
     const currentModel = MODELS.find(m => m.id === selectedModel)!;
 
-    // Close dropdown when clicking outside
     useEffect(() => {
         const handleClickOutside = (event: MouseEvent) => {
             if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
@@ -55,31 +54,51 @@ export function ModelPicker({
         <div className="model-dropdown" ref={dropdownRef}>
             <button
                 onClick={() => !modelLoading && setShowMenu(!showMenu)}
-                className={`model-dropdown-btn px-5 py-3 bg-slate-800/90 border-2 border-slate-600 rounded-2xl text-slate-100 font-semibold flex items-center gap-2 shadow-sm relative overflow-hidden ${modelLoading ? 'cursor-default' : ''}`}
+                className="model-dropdown-btn"
+                disabled={modelLoading}
             >
-                {/* Loading progress bar */}
-                {modelLoading && (
-                    <div className="absolute inset-0 bg-sage-500/20">
-                        <div
-                            className="h-full bg-sage-500/40 transition-all duration-300 ease-out"
-                            style={{
-                                animation: 'model-load-sweep 2s ease-in-out infinite'
-                            }}
-                        />
+                {/* Status indicator */}
+                <div 
+                    className="w-2.5 h-2.5 rounded-full"
+                    style={{
+                        background: modelLoading 
+                            ? '#666' 
+                            : modelLoaded 
+                                ? '#22c55e' 
+                                : '#444',
+                        boxShadow: modelLoaded ? '0 0 8px rgba(34, 197, 94, 0.5)' : 'none'
+                    }}
+                />
+
+                <div className="text-left">
+                    <div className="text-sm font-medium text-white">
+                        {modelLoading ? 'Loading...' : modelLoaded ? currentModel.name : 'Select Model'}
                     </div>
-                )}
-                <svg className="w-4 h-4 relative z-10" viewBox="0 0 24 24" fill="currentColor">
-                    <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z" />
-                </svg>
-                <span className="relative z-10">
-                    {modelLoading ? 'Loading...' : modelLoaded ? currentModel.name : 'Select Model'}
-                </span>
+                    {!modelLoading && (
+                        <div className="text-xs text-[#666]">
+                            {modelLoaded ? `${currentModel.stems} stems • ${currentModel.sizeMB}MB` : 'Choose to start'}
+                        </div>
+                    )}
+                </div>
+
                 {!modelLoading && (
-                    <svg className={`w-4 h-4 ml-1 transition-transform relative z-10 ${showMenu ? 'rotate-180' : ''}`} viewBox="0 0 24 24" fill="currentColor">
+                    <svg 
+                        className={`w-4 h-4 text-[#666] ml-2 transition-transform ${showMenu ? 'rotate-180' : ''}`}
+                        viewBox="0 0 24 24" 
+                        fill="currentColor"
+                    >
                         <path d="M7 10l5 5 5-5H7z" />
                     </svg>
                 )}
+
+                {modelLoading && (
+                    <svg className="w-4 h-4 text-[#666] ml-2 animate-spin" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                    </svg>
+                )}
             </button>
+
             {showMenu && (
                 <div className="model-dropdown-menu">
                     {MODELS.map((model) => {
@@ -87,29 +106,33 @@ export function ModelPicker({
                         return (
                             <div
                                 key={model.id}
-                                className={`model-dropdown-item flex items-center gap-3 ${selectedModel === model.id ? 'selected' : ''} ${isLoaded ? 'cursor-default' : ''}`}
+                                className={`model-dropdown-item ${isLoaded ? 'selected' : ''}`}
                                 onClick={() => handleSelect(model.id)}
                             >
+                                <div 
+                                    className="w-2.5 h-2.5 rounded-full flex-shrink-0"
+                                    style={{
+                                        background: isLoaded ? '#22c55e' : '#333',
+                                        boxShadow: isLoaded ? '0 0 8px rgba(34, 197, 94, 0.5)' : 'none'
+                                    }}
+                                />
+
                                 <div className="flex-1 min-w-0">
-                                    <div className="font-semibold text-slate-100 flex items-center gap-2">
-                                        {model.name}
-                                        {model.badge === 'recommended' && (
-                                            <span className="text-[10px] px-1.5 py-0.5 bg-cyan-500/20 text-cyan-400 rounded-full font-medium">
-                                                Recommended
-                                            </span>
-                                        )}
-                                        {model.badge === 'experimental' && (
-                                            <span className="text-[10px] px-1.5 py-0.5 bg-amber-500/20 text-amber-400 rounded-full font-medium">
-                                                Experimental
+                                    <div className="flex items-center gap-2">
+                                        <span className="font-medium text-white">{model.name}</span>
+                                        {model.badge && (
+                                            <span className={`status-badge ${model.badge}`}>
+                                                {model.badge === 'recommended' ? 'Best' : 'Beta'}
                                             </span>
                                         )}
                                     </div>
-                                    <div className="text-xs text-slate-400">
-                                        {model.stems} stems • {model.sizeMB} MB
+                                    <div className="text-xs text-[#666] mt-0.5">
+                                        {model.stems} stems • {model.sizeMB} MB download
                                     </div>
                                 </div>
+
                                 {isLoaded && (
-                                    <svg className="w-5 h-5 text-cyan-400 flex-shrink-0" viewBox="0 0 24 24" fill="currentColor">
+                                    <svg className="w-4 h-4 text-[#22c55e] flex-shrink-0" viewBox="0 0 24 24" fill="currentColor">
                                         <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z" />
                                     </svg>
                                 )}

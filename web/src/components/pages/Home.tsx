@@ -1,34 +1,22 @@
 import { useState, useRef, useEffect, type DragEvent } from 'react';
 import { useDemucs } from '../../hooks/useDemucs';
-import { Vinyl } from '../ui/Vinyl';
-import { ModelPicker } from '../ui/ModelPicker';
+import { Vinyl, ChannelStrip } from '../ui/Vinyl';
+import { Settings, type ExecutionBackend } from '../ui/Settings';
 import type { ModelType } from '../../types';
 
-interface StemInfo {
+interface StemStyle {
     name: string;
-    bg: string;
-    accent: string;
-    btnBg: string;
-    hoverGlow: string;
+    color: string;
+    colorRgb: string;
 }
 
-const STEM_STYLES: Record<string, StemInfo> = {
-    drums: { name: 'Drums', bg: '#2D2A1F', accent: '#FBBF24', btnBg: '#F59E0B', hoverGlow: 'rgba(251, 191, 36, 0.3)' },
-    bass: { name: 'Bass', bg: '#1F2D20', accent: '#4ADE80', btnBg: '#22C55E', hoverGlow: 'rgba(74, 222, 128, 0.3)' },
-    guitar: { name: 'Guitar', bg: '#2D1F1F', accent: '#FB7185', btnBg: '#F43F5E', hoverGlow: 'rgba(251, 113, 133, 0.3)' },
-    piano: { name: 'Piano', bg: '#251F2D', accent: '#C084FC', btnBg: '#A855F7', hoverGlow: 'rgba(192, 132, 252, 0.3)' },
-    other: { name: 'Other', bg: '#252528', accent: '#A1A1AA', btnBg: '#71717A', hoverGlow: 'rgba(161, 161, 170, 0.3)' },
-    vocals: { name: 'Vocals', bg: '#2D1F25', accent: '#F472B6', btnBg: '#EC4899', hoverGlow: 'rgba(244, 114, 182, 0.3)' },
-};
-
-// Generate organic waveform heights
-const generateWaveform = (seed: number) => {
-    return Array.from({ length: 60 }).map((_, i) => {
-        const base = Math.sin((i + seed) * 0.4) * 30;
-        const noise = Math.sin((i + seed) * 1.3) * 15;
-        const peak = i > 8 && i < 20 ? 10 : 0;
-        return Math.max(20, Math.min(95, 50 + base + noise + peak));
-    });
+const STEM_STYLES: Record<string, StemStyle> = {
+    drums: { name: 'Drums', color: '#c9a227', colorRgb: '201, 162, 39' },
+    bass: { name: 'Bass', color: '#22c55e', colorRgb: '34, 197, 94' },
+    guitar: { name: 'Guitar', color: '#ef4444', colorRgb: '239, 68, 68' },
+    piano: { name: 'Piano', color: '#a855f7', colorRgb: '168, 85, 247' },
+    other: { name: 'Other', color: '#6b7280', colorRgb: '107, 114, 128' },
+    vocals: { name: 'Vocals', color: '#ec4899', colorRgb: '236, 72, 153' },
 };
 
 const formatTime = (seconds: number) => {
@@ -48,8 +36,9 @@ export function Home() {
         progress,
         status,
         stemUrls,
-        stemWaveforms,
         artworkUrl,
+        trackTitle,
+        trackArtist,
         audioError,
         loadModel,
         unloadModel,
@@ -60,83 +49,95 @@ export function Home() {
     } = useDemucs();
 
     const fileInputRef = useRef<HTMLInputElement>(null);
+    const dropZoneRef = useRef<HTMLDivElement>(null);
     const [selectedModel, setSelectedModel] = useState<ModelType>('htdemucs');
+    const [selectedBackend, setSelectedBackend] = useState<ExecutionBackend>('webgpu');
     const [volumes, setVolumes] = useState<Record<string, number>>({});
     const [playingStems, setPlayingStems] = useState<Record<string, boolean>>({});
-    const [currentTimes, setCurrentTimes] = useState<Record<string, number>>({});
-    const [hoverInfo, setHoverInfo] = useState<{ stemKey: string; x: number; time: number } | null>(null);
+    const [currentTime, setCurrentTime] = useState(0);
     const [isDragging, setIsDragging] = useState(false);
     const audioRefs = useRef<Record<string, HTMLAudioElement>>({});
-    const waveformRefs = useRef<Record<string, HTMLDivElement>>({});
 
-    // Merge mode state
+    // Merge mode
     const [mergeMode, setMergeMode] = useState(false);
     const [selectedStems, setSelectedStems] = useState<Set<string>>(new Set());
     const [mergedStemUrl, setMergedStemUrl] = useState<string | null>(null);
-    const [mergedWaveform, setMergedWaveform] = useState<number[] | null>(null);
     const [isMerging, setIsMerging] = useState(false);
 
     const duration = audioBuffer?.duration ?? 0;
     const stems = Object.keys(stemUrls);
     const hasStemsReady = stems.length > 0;
+    const isAnyPlaying = Object.values(playingStems).some(Boolean);
 
-
-
+    // Sync volumes
     useEffect(() => {
         Object.keys(audioRefs.current).forEach(key => {
             const audio = audioRefs.current[key];
             if (audio) {
-                const volume = volumes[key] ?? 80;
-                audio.volume = volume / 100;
+                audio.volume = (volumes[key] ?? 80) / 100;
             }
         });
     }, [volumes]);
 
-    const handleModelSelect = async (model: ModelType) => {
-        // Don't reload the same model
-        if (modelLoaded && selectedModel === model) {
-            return;
-        }
+    // Time sync
+    useEffect(() => {
+        const interval = setInterval(() => {
+            const firstPlaying = Object.entries(playingStems).find(([, playing]) => playing);
+            if (firstPlaying) {
+                const audio = audioRefs.current[firstPlaying[0]];
+                if (audio) {
+                    setCurrentTime(audio.currentTime);
+                }
+            }
+        }, 100);
+        return () => clearInterval(interval);
+    }, [playingStems]);
+
+    const handleModelChange = async (model: ModelType) => {
+        if (modelLoaded && selectedModel === model) return;
+        if (modelLoaded) await unloadModel();
         setSelectedModel(model);
-        // Unload current model first to free memory before loading new one
-        if (modelLoaded) {
-            await unloadModel();
-        }
-        loadModel(model);
     };
 
-    const handleFileClick = () => {
-        fileInputRef.current?.click();
+    const handleBackendChange = (backend: ExecutionBackend) => {
+        setSelectedBackend(backend);
     };
+
+    const handleSeparate = async () => {
+        if (!audioLoaded) return;
+        
+        if (!modelLoaded) {
+            const success = await loadModel(selectedModel, selectedBackend);
+            if (success) {
+                separateAudio(true); // Skip model check since we just loaded it
+            }
+        } else {
+            separateAudio();
+        }
+    };
+
+    const handleFileClick = () => fileInputRef.current?.click();
 
     const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];
-        if (file) {
-            loadAudio(file);
-        }
+        if (file) loadAudio(file);
     };
 
     const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
         e.preventDefault();
-        e.stopPropagation();
         setIsDragging(true);
     };
 
     const handleDragLeave = (e: DragEvent<HTMLDivElement>) => {
         e.preventDefault();
-        e.stopPropagation();
         setIsDragging(false);
     };
 
     const handleDrop = (e: DragEvent<HTMLDivElement>) => {
         e.preventDefault();
-        e.stopPropagation();
         setIsDragging(false);
-
         const file = e.dataTransfer.files?.[0];
-        if (file) {
-            loadAudio(file);
-        }
+        if (file) loadAudio(file);
     };
 
     const togglePlay = (stemName: string) => {
@@ -150,6 +151,37 @@ export function Home() {
             audio.play();
             setPlayingStems(prev => ({ ...prev, [stemName]: true }));
         }
+    };
+
+    const playAll = () => {
+        stems.forEach(stem => {
+            const audio = audioRefs.current[stem];
+            if (audio) {
+                audio.currentTime = currentTime;
+                audio.play();
+                setPlayingStems(prev => ({ ...prev, [stem]: true }));
+            }
+        });
+    };
+
+    const pauseAll = () => {
+        stems.forEach(stem => {
+            const audio = audioRefs.current[stem];
+            if (audio) audio.pause();
+        });
+        setPlayingStems({});
+    };
+
+    const stopAll = () => {
+        stems.forEach(stem => {
+            const audio = audioRefs.current[stem];
+            if (audio) {
+                audio.pause();
+                audio.currentTime = 0;
+            }
+        });
+        setPlayingStems({});
+        setCurrentTime(0);
     };
 
     const handleDownload = (stemName: string) => {
@@ -178,34 +210,27 @@ export function Home() {
     const toggleStemSelection = (stemKey: string) => {
         setSelectedStems(prev => {
             const next = new Set(prev);
-            if (next.has(stemKey)) {
-                next.delete(stemKey);
-            } else {
-                next.add(stemKey);
-            }
+            if (next.has(stemKey)) next.delete(stemKey);
+            else next.add(stemKey);
             return next;
         });
     };
 
     const handleMergeStems = async () => {
         if (selectedStems.size === 0) return;
-
         setIsMerging(true);
 
         try {
-            // Create AudioContext for decoding
             const audioContext = new AudioContext({ sampleRate: 44100 });
-            const numChannels = 2;
-
-            // Decode all selected stems
             const decodedBuffers: AudioBuffer[] = [];
+            
             for (const stemKey of selectedStems) {
                 const url = stemUrls[stemKey];
                 if (url) {
                     const response = await fetch(url);
                     const arrayBuffer = await response.arrayBuffer();
-                    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-                    decodedBuffers.push(audioBuffer);
+                    const buffer = await audioContext.decodeAudioData(arrayBuffer);
+                    decodedBuffers.push(buffer);
                 }
             }
 
@@ -214,105 +239,59 @@ export function Home() {
                 return;
             }
 
-            // Get the length from first buffer (all should be same length)
             const numSamples = decodedBuffers[0].length;
-
-            // Sum all stems together
-            const mergedData = new Float32Array(numSamples * numChannels);
+            const mergedData = new Float32Array(numSamples * 2);
+            
             for (const buffer of decodedBuffers) {
                 const left = buffer.getChannelData(0);
                 const right = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : left;
-
                 for (let i = 0; i < numSamples; i++) {
                     mergedData[i * 2] += left[i];
                     mergedData[i * 2 + 1] += right[i];
                 }
             }
 
-            // Create WAV blob using the same utility
             const { createWavBlob } = await import('../../utils/wav-utils');
-            const blob = createWavBlob(mergedData, numChannels, 44100);
+            const blob = createWavBlob(mergedData, 2, 44100);
             const url = URL.createObjectURL(blob);
 
-            // Compute waveform for visualization
-            const numBars = 60;
-            const samplesPerBar = Math.floor(mergedData.length / numBars);
-            const bars: number[] = [];
-
-            for (let i = 0; i < numBars; i++) {
-                const start = i * samplesPerBar;
-                const end = Math.min(start + samplesPerBar, mergedData.length);
-
-                let sumSquares = 0;
-                for (let j = start; j < end; j++) {
-                    sumSquares += mergedData[j] * mergedData[j];
-                }
-                const rms = Math.sqrt(sumSquares / (end - start));
-                const barHeight = Math.min(100, Math.max(15, rms * 300));
-                bars.push(barHeight);
-            }
-
-            // Clean up old merged URL if exists
-            if (mergedStemUrl) {
-                URL.revokeObjectURL(mergedStemUrl);
-            }
-
+            if (mergedStemUrl) URL.revokeObjectURL(mergedStemUrl);
             setMergedStemUrl(url);
-            setMergedWaveform(bars);
             setMergeMode(false);
             setSelectedStems(new Set());
-
             audioContext.close();
         } catch (error) {
-            console.error('Error merging stems:', error);
+            console.error('Error merging:', error);
         }
 
         setIsMerging(false);
     };
 
-    const handleBackToStems = () => {
-        if (mergedStemUrl) {
-            URL.revokeObjectURL(mergedStemUrl);
-        }
-        setMergedStemUrl(null);
-        setMergedWaveform(null);
+    // Get display name for plaque - prefer metadata title over filename
+    const getTrackName = () => {
+        if (!audioFile) return null;
+        // Prefer metadata title if available
+        if (trackTitle) return trackTitle;
+        // Fall back to filename without extension
+        const name = audioFile.name;
+        return name.replace(/\.[^/.]+$/, '');
     };
 
-    const handleCancelMerge = () => {
-        setMergeMode(false);
-        setSelectedStems(new Set());
+    // Get artist name for plaque subtitle
+    const getArtistName = () => {
+        return trackArtist;
     };
 
     return (
-        <div className="w-full max-w-4xl mx-auto p-8 flex-1">
+        <>
+            <Settings
+                selectedModel={selectedModel}
+                selectedBackend={selectedBackend}
+                onModelChange={handleModelChange}
+                onBackendChange={handleBackendChange}
+            />
 
-            {/* Header */}
-            <header className="text-center mb-10">
-                <h1
-                    className="text-5xl font-bold text-slate-100 tracking-wide"
-                    style={{ textShadow: '0 2px 4px rgba(0,0,0,0.3)' }}
-                >
-                    demucs.app
-                </h1>
-            </header>
-
-            {/* Controls Row */}
-            <div className="flex flex-wrap items-center justify-center gap-3 mb-10">
-                <ModelPicker
-                    selectedModel={selectedModel}
-                    modelLoaded={modelLoaded}
-                    modelLoading={modelLoading}
-                    onModelSelect={handleModelSelect}
-                />
-
-                <button
-                    onClick={separateAudio}
-                    disabled={!modelLoaded || !audioLoaded || separating}
-                    className="btn-primary px-6 py-3 disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                    {separating ? 'Separating...' : 'Separate Audio'}
-                </button>
-
+            <main className="flex-1 relative">
                 <input
                     ref={fileInputRef}
                     type="file"
@@ -320,535 +299,226 @@ export function Home() {
                     onChange={handleFileChange}
                     className="hidden"
                 />
-            </div>
 
-            {/* Vinyl Progress - Show when separating */}
-            {separating && (
-                <div className="flex flex-col items-center mb-10">
-                    <Vinyl
-                        progress={progress}
-                        variant="terracotta"
-                        className="w-52 h-52 mb-5"
-                        artworkUrl={artworkUrl}
+                {/* Hidden audio elements */}
+                {stems.map(stemKey => (
+                    <audio
+                        key={stemKey}
+                        ref={el => { if (el) audioRefs.current[stemKey] = el; }}
+                        src={stemUrls[stemKey]}
+                        onEnded={() => setPlayingStems(prev => ({ ...prev, [stemKey]: false }))}
                     />
+                ))}
+                {mergedStemUrl && (
+                    <audio
+                        ref={el => { if (el) audioRefs.current['merged'] = el; }}
+                        src={mergedStemUrl}
+                        onEnded={() => setPlayingStems(prev => ({ ...prev, merged: false }))}
+                    />
+                )}
 
-                    <span
-                        className="text-4xl font-bold text-slate-100"
-                        style={{ textShadow: '0 2px 4px rgba(0,0,0,0.3)' }}
-                    >
-                        {Math.round(progress)}%
-                    </span>
-                    <span className="text-slate-400 text-sm mt-1 font-medium">{status}</span>
-                </div>
-            )}
+                {/* Award Frame - Only show when no stems ready */}
+                {!hasStemsReady && (
+                    <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                        <div 
+                            ref={dropZoneRef}
+                            className={`award-frame pointer-events-auto ${isDragging ? 'ring-2 ring-[#c9a227]' : ''}`}
+                            onClick={!audioFile ? handleFileClick : undefined}
+                            onDragOver={handleDragOver}
+                            onDragLeave={handleDragLeave}
+                            onDrop={handleDrop}
+                            style={{ cursor: !audioFile ? 'pointer' : 'default' }}
+                        >
+                            <div className="award-frame-inner">
+                                {/* Gold Vinyl */}
+                                <Vinyl
+                                    spinning={separating || isAnyPlaying}
+                                    artworkUrl={artworkUrl}
+                                    progress={separating ? progress : undefined}
+                                />
 
-            {/* File info - Show when audio loaded and not separating */}
-            {audioFile && !separating && (
-                <div className="flex items-center justify-center gap-4 mb-8">
-                    {/* Album artwork (if available) */}
-                    {artworkUrl && (
-                        <img
-                            src={artworkUrl}
-                            alt="Album artwork"
-                            className="w-16 h-16 rounded-xl object-cover shadow-lg flex-shrink-0"
-                            style={{
-                                boxShadow: '0 4px 16px rgba(0, 0, 0, 0.4)'
-                            }}
-                        />
-                    )}
-                    {/* File details */}
-                    <div className={artworkUrl ? 'text-left' : 'text-center'}>
-                        <p className="text-xl font-bold text-slate-100">{audioFile.name}</p>
-                        <p className="text-slate-400 text-sm font-medium">
-                            {formatTime(duration)} • 44.1 kHz • Stereo
-                        </p>
-                    </div>
-                </div>
-            )}
-
-            {/* Stems Section */}
-            {hasStemsReady && (
-                <div className="mb-8">
-                    <div className="flex items-center justify-center gap-4 mb-5">
-                        <div className="h-px flex-1 max-w-[80px] bg-gradient-to-r from-transparent to-slate-600" />
-                        <h2 className="text-slate-400 text-xs font-bold tracking-[0.25em] uppercase">
-                            Stems
-                        </h2>
-                        <div className="h-px flex-1 max-w-[80px] bg-gradient-to-l from-transparent to-slate-600" />
-                    </div>
-
-                    <div className="grid gap-3">
-                        {stems.map((stemKey, stemIndex) => {
-                            const stemStyle = STEM_STYLES[stemKey] || STEM_STYLES.other;
-                            // Use real waveform if available, fallback to generated
-                            const waveform = stemWaveforms[stemKey] || generateWaveform(stemIndex * 7);
-                            const volume = volumes[stemKey] ?? 80;
-
-                            return (
-                                <div
-                                    key={stemKey}
-                                    className="stem-card rounded-3xl card-shadow"
-                                    style={{ backgroundColor: stemStyle.bg }}
-                                >
-                                    <audio
-                                        ref={(el) => {
-                                            if (el) {
-                                                audioRefs.current[stemKey] = el;
-                                                el.volume = (volumes[stemKey] ?? 80) / 100;
-                                            }
-                                        }}
-                                        src={stemUrls[stemKey]}
-                                        onEnded={() => setPlayingStems(prev => ({ ...prev, [stemKey]: false }))}
-                                        onTimeUpdate={(e) => {
-                                            const audio = e.currentTarget;
-                                            if (audio) {
-                                                setCurrentTimes(prev => ({ ...prev, [stemKey]: audio.currentTime }));
-                                            }
-                                        }}
-                                    />
-
-                                    <div className="p-5">
-                                        {/* Top row: Icon, Name, Controls */}
-                                        <div className="flex items-center gap-4">
-                                            {/* Merge mode checkbox */}
-                                            {mergeMode && (
-                                                <button
-                                                    onClick={() => toggleStemSelection(stemKey)}
-                                                    className={`w-10 h-10 sm:w-12 sm:h-12 rounded-2xl flex items-center justify-center flex-shrink-0 border-2 transition-all ${selectedStems.has(stemKey)
-                                                        ? 'bg-cyan-500 border-cyan-400'
-                                                        : 'bg-slate-700/50 border-slate-500 hover:border-slate-400'
-                                                        }`}
-                                                >
-                                                    {selectedStems.has(stemKey) && (
-                                                        <svg className="w-5 h-5 sm:w-6 sm:h-6 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
-                                                            <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-                                                        </svg>
-                                                    )}
-                                                </button>
-                                            )}
-                                            {/* Icon - hidden in merge mode */}
-                                            {!mergeMode && (
-                                                <div
-                                                    className="w-10 h-10 sm:w-12 sm:h-12 rounded-2xl flex items-center justify-center flex-shrink-0"
-                                                    style={{
-                                                        background: `linear-gradient(145deg, ${stemStyle.btnBg}, ${stemStyle.accent})`
-                                                    }}
-                                                >
-                                                    <svg className="w-5 h-5 sm:w-6 sm:h-6 text-white drop-shadow-sm" viewBox="0 0 24 24" fill="currentColor">
-                                                        <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z" />
-                                                    </svg>
-                                                </div>
-                                            )}
-
-                                            {/* Name & Duration */}
-                                            <div className="w-20 flex-shrink-0">
-                                                <p className="text-base sm:text-lg font-bold text-slate-100 truncate">{stemStyle.name}</p>
-                                                <p className="text-slate-400 text-xs font-medium">{formatTime(duration)}</p>
-                                            </div>
-
-                                            {/* Desktop waveform - hidden on mobile */}
-                                            <div
-                                                ref={(el) => { if (el) waveformRefs.current[stemKey] = el; }}
-                                                className="hidden md:flex flex-1 relative items-center justify-center gap-[3px] h-10 cursor-pointer overflow-visible"
-                                                onClick={(e) => {
-                                                    const rect = e.currentTarget.getBoundingClientRect();
-                                                    const x = e.clientX - rect.left;
-                                                    const percent = x / rect.width;
-                                                    const seekTime = percent * duration;
-                                                    const audio = audioRefs.current[stemKey];
-                                                    if (audio) {
-                                                        audio.currentTime = seekTime;
-                                                    }
-                                                }}
-                                                onMouseMove={(e) => {
-                                                    const rect = e.currentTarget.getBoundingClientRect();
-                                                    const x = e.clientX - rect.left;
-                                                    const percent = Math.max(0, Math.min(1, x / rect.width));
-                                                    const time = percent * duration;
-                                                    setHoverInfo({ stemKey, x, time });
-                                                }}
-                                                onMouseLeave={() => setHoverInfo(null)}
-                                            >
-                                                {/* Tooltip */}
-                                                {hoverInfo && hoverInfo.stemKey === stemKey && (
-                                                    <div
-                                                        className="absolute -top-8 px-2 py-1 bg-slate-700 text-white text-xs rounded shadow-lg whitespace-nowrap z-10 pointer-events-none"
-                                                        style={{ left: hoverInfo.x, transform: 'translateX(-50%)' }}
-                                                    >
-                                                        {formatTime(hoverInfo.time)}
-                                                    </div>
-                                                )}
-
-                                                {/* Playhead indicator */}
-                                                {duration > 0 && (
-                                                    <div
-                                                        className="absolute top-0 bottom-0 w-0.5 bg-slate-100 z-10 pointer-events-none"
-                                                        style={{ left: `${((currentTimes[stemKey] || 0) / duration) * 100}%` }}
-                                                    />
-                                                )}
-
-                                                {/* Waveform bars */}
-                                                {waveform.map((height, i) => (
-                                                    <div
-                                                        key={i}
-                                                        className="waveform-bar flex-1 rounded-full"
-                                                        style={{
-                                                            height: `${height}%`,
-                                                            backgroundColor: stemStyle.accent,
-                                                            opacity: 0.5 + (height / 200)
-                                                        }}
-                                                    />
-                                                ))}
-                                            </div>
-
-                                            {/* Volume slider - hidden on mobile */}
-                                            <div className="hidden sm:flex items-center gap-2 w-28 lg:w-36">
-                                                <svg className="w-4 h-4 text-slate-400 flex-shrink-0" viewBox="0 0 24 24" fill="currentColor">
-                                                    <path d="M3 9v6h4l5 5V4L7 9H3z" />
-                                                </svg>
-                                                <input
-                                                    type="range"
-                                                    value={volume}
-                                                    onChange={(e) => setVolumes(prev => ({ ...prev, [stemKey]: Number(e.target.value) }))}
-                                                    className="flex-1"
-                                                    style={{
-                                                        background: `linear-gradient(90deg, ${stemStyle.accent} ${volume}%, #334155 ${volume}%)`
-                                                    }}
-                                                />
-                                            </div>
-
-                                            {/* Play Button */}
-                                            <button
-                                                onClick={() => togglePlay(stemKey)}
-                                                className="btn-play w-10 h-10 sm:w-11 sm:h-11 rounded-2xl flex items-center justify-center flex-shrink-0"
-                                                style={{
-                                                    background: `linear-gradient(145deg, ${stemStyle.btnBg}, ${stemStyle.accent})`
-                                                }}
-                                            >
-                                                {playingStems[stemKey] ? (
-                                                    <svg className="w-4 h-4 sm:w-5 sm:h-5 text-white drop-shadow-sm" fill="currentColor" viewBox="0 0 24 24">
-                                                        <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" />
-                                                    </svg>
-                                                ) : (
-                                                    <svg className="w-4 h-4 sm:w-5 sm:h-5 text-white ml-0.5 drop-shadow-sm" fill="currentColor" viewBox="0 0 24 24">
-                                                        <path d="M8 5v14l11-7z" />
-                                                    </svg>
-                                                )}
-                                            </button>
-
-                                            {/* Download Button */}
-                                            <button
-                                                onClick={() => handleDownload(stemKey)}
-                                                className="btn-download w-10 h-10 sm:w-11 sm:h-11 bg-slate-700/80 hover:bg-slate-600 rounded-2xl flex items-center justify-center flex-shrink-0 border border-slate-600 shadow-sm"
-                                            >
-                                                <svg className="w-4 h-4 sm:w-5 sm:h-5 text-slate-200" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                                                    <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" />
-                                                </svg>
-                                            </button>
-                                        </div>
-
-                                        {/* Mobile waveform - shown only on mobile, full width */}
-                                        <div
-                                            className="md:hidden relative flex items-center gap-[2px] h-8 mt-3 cursor-pointer overflow-visible"
-                                            onClick={(e) => {
-                                                const rect = e.currentTarget.getBoundingClientRect();
-                                                const x = e.clientX - rect.left;
-                                                const percent = x / rect.width;
-                                                const seekTime = percent * duration;
-                                                const audio = audioRefs.current[stemKey];
-                                                if (audio) {
-                                                    audio.currentTime = seekTime;
+                                {/* Plaque */}
+                                <div className="plaque">
+                                    {audioFile ? (
+                                        <>
+                                            <div className="plaque-title">{getTrackName()}</div>
+                                            <div className="plaque-subtitle">
+                                                {separating 
+                                                    ? status 
+                                                    : (getArtistName() || formatTime(duration))
                                                 }
-                                            }}
-                                        >
-                                            {/* Playhead indicator */}
-                                            {duration > 0 && (
-                                                <div
-                                                    className="absolute top-0 bottom-0 w-0.5 bg-slate-100 z-10 pointer-events-none"
-                                                    style={{ left: `${((currentTimes[stemKey] || 0) / duration) * 100}%` }}
-                                                />
-                                            )}
-
-                                            {/* Waveform bars */}
-                                            {waveform.map((height, i) => (
-                                                <div
-                                                    key={i}
-                                                    className="waveform-bar flex-1 rounded-full"
-                                                    style={{
-                                                        height: `${height}%`,
-                                                        backgroundColor: stemStyle.accent,
-                                                        opacity: 0.5 + (height / 200)
-                                                    }}
-                                                />
-                                            ))}
+                                            </div>
+                                        </>
+                                    ) : (
+                                        <div className="plaque-empty">
+                                            {isDragging ? 'Drop to load' : 'Drop audio or click to browse'}
                                         </div>
-                                    </div>
-                                </div>
-                            );
-                        })}
-                    </div>
-                </div>
-            )}
-
-            {/* Clickable Drop Zone - No audio yet */}
-            {!hasStemsReady && !separating && !audioFile && (
-                <div
-                    onClick={handleFileClick}
-                    onDragOver={handleDragOver}
-                    onDragLeave={handleDragLeave}
-                    onDrop={handleDrop}
-                    className={`drop-zone cursor-pointer text-center py-20 mb-8 rounded-3xl border-2 border-dashed transition-all ${isDragging
-                        ? 'border-cyan-400 bg-cyan-500/10 scale-[1.02]'
-                        : 'border-slate-600 bg-slate-800/30 hover:bg-slate-700/40 hover:border-slate-500'
-                        }`}
-                >
-                    <div className="relative w-32 h-32 mx-auto mb-6">
-                        <Vinyl
-                            variant="cyan"
-                            animate={false}
-                            className={`w-32 h-32 transition-opacity ${isDragging ? 'opacity-100' : 'opacity-80'}`}
-                        />
-                    </div>
-                    <p className="text-slate-200 font-semibold text-lg">
-                        {isDragging ? 'Drop your audio file here' : 'Drag & drop or click to load audio'}
-                    </p>
-                </div>
-            )}
-
-            {/* Audio loaded but not separated yet */}
-            {!hasStemsReady && !separating && audioFile && (
-                <div className="text-center py-8 mb-8">
-                    {modelLoaded ? (
-                        <>
-                            <p className="text-slate-300 font-medium">Ready to separate</p>
-                            <p className="text-slate-500 text-sm mt-1">Click "Separate Audio" to extract stems</p>
-                        </>
-                    ) : (
-                        <>
-                            <p className="text-slate-300 font-medium">Select a model first</p>
-                            <p className="text-slate-500 text-sm mt-1">Choose a model from the dropdown above</p>
-                        </>
-                    )}
-                </div>
-            )}
-
-            {/* Action Buttons */}
-            {hasStemsReady && !mergedStemUrl && (
-                <div className="flex flex-wrap items-center justify-center gap-4 mb-12">
-                    {!mergeMode ? (
-                        <>
-                            <button
-                                onClick={handleDownloadAll}
-                                className="px-6 py-2.5 bg-gradient-to-b from-terracotta-400 to-terracotta-600 hover:from-terracotta-400 hover:to-terracotta-500 text-white font-semibold rounded-xl shadow-md transition-all hover:shadow-lg hover:-translate-y-0.5"
-                                style={{ boxShadow: '0 4px 12px rgba(152, 80, 48, 0.3)' }}
-                            >
-                                <span className="flex items-center gap-2">
-                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                                        <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" />
-                                    </svg>
-                                    Download All
-                                </span>
-                            </button>
-                            <button
-                                onClick={() => setMergeMode(true)}
-                                className="px-5 py-2.5 bg-gradient-to-b from-cyan-500 to-cyan-600 hover:from-cyan-400 hover:to-cyan-500 text-white font-semibold rounded-xl shadow-md transition-all hover:shadow-lg hover:-translate-y-0.5"
-                            >
-                                <span className="flex items-center gap-2">
-                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                                        <path d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14" />
-                                    </svg>
-                                    Merge Stems
-                                </span>
-                            </button>
-                            <button
-                                onClick={resetForNewTrack}
-                                className="px-5 py-2.5 bg-slate-700 hover:bg-slate-600 text-slate-100 font-semibold rounded-xl transition-colors"
-                            >
-                                <span className="flex items-center gap-2">
-                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                                        <path d="M12 4v16m8-8H4" />
-                                    </svg>
-                                    Separate Another
-                                </span>
-                            </button>
-                        </>
-                    ) : (
-                        <>
-                            <button
-                                onClick={handleMergeStems}
-                                disabled={selectedStems.size === 0 || isMerging}
-                                className="px-6 py-2.5 bg-gradient-to-b from-cyan-500 to-cyan-600 hover:from-cyan-400 hover:to-cyan-500 disabled:from-slate-600 disabled:to-slate-700 text-white font-semibold rounded-xl shadow-md transition-all hover:shadow-lg hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-60"
-                            >
-                                <span className="flex items-center gap-2">
-                                    {isMerging ? (
-                                        <>
-                                            <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
-                                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                                            </svg>
-                                            Merging...
-                                        </>
-                                    ) : (
-                                        <>
-                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                                                <path d="M5 13l4 4L19 7" />
-                                            </svg>
-                                            Merge Selected ({selectedStems.size})
-                                        </>
                                     )}
-                                </span>
-                            </button>
-                            <button
-                                onClick={handleCancelMerge}
-                                className="px-5 py-2.5 bg-slate-700 hover:bg-slate-600 text-slate-100 font-semibold rounded-xl transition-colors"
-                            >
-                                Cancel
-                            </button>
-                        </>
-                    )}
-                </div>
-            )}
-
-            {/* Merged Stem Display */}
-            {mergedStemUrl && mergedWaveform && (
-                <div className="mb-8">
-                    <div className="flex items-center justify-center gap-4 mb-5">
-                        <div className="h-px flex-1 max-w-[80px] bg-gradient-to-r from-transparent to-cyan-600" />
-                        <h2 className="text-cyan-400 text-xs font-bold tracking-[0.25em] uppercase">
-                            Merged
-                        </h2>
-                        <div className="h-px flex-1 max-w-[80px] bg-gradient-to-l from-transparent to-cyan-600" />
-                    </div>
-
-                    <div className="stem-card rounded-3xl card-shadow" style={{ backgroundColor: '#1F2D2D' }}>
-                        <audio
-                            ref={(el) => { if (el) audioRefs.current['merged'] = el; }}
-                            src={mergedStemUrl}
-                            onEnded={() => setPlayingStems(prev => ({ ...prev, merged: false }))}
-                            onTimeUpdate={(e) => {
-                                const audio = e.currentTarget;
-                                if (audio) {
-                                    setCurrentTimes(prev => ({ ...prev, merged: audio.currentTime }));
-                                }
-                            }}
-                        />
-
-                        <div className="p-5">
-                            <div className="flex items-center gap-4">
-                                {/* Icon */}
-                                <div
-                                    className="w-10 h-10 sm:w-12 sm:h-12 rounded-2xl flex items-center justify-center flex-shrink-0"
-                                    style={{ background: 'linear-gradient(145deg, #06B6D4, #22D3EE)' }}
-                                >
-                                    <svg className="w-5 h-5 sm:w-6 sm:h-6 text-white drop-shadow-sm" viewBox="0 0 24 24" fill="currentColor">
-                                        <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z" />
-                                    </svg>
                                 </div>
 
-                                {/* Name & Duration */}
-                                <div className="w-20 flex-shrink-0">
-                                    <p className="text-base sm:text-lg font-bold text-slate-100 truncate">Merged</p>
-                                    <p className="text-slate-400 text-xs font-medium">{formatTime(duration)}</p>
-                                </div>
-
-                                {/* Waveform */}
-                                <div className="hidden md:flex flex-1 relative items-center justify-center gap-[3px] h-10 cursor-pointer overflow-visible">
-                                    {duration > 0 && (
-                                        <div
-                                            className="absolute top-0 bottom-0 w-0.5 bg-slate-100 z-10 pointer-events-none"
-                                            style={{ left: `${((currentTimes['merged'] || 0) / duration) * 100}%` }}
-                                        />
-                                    )}
-                                    {mergedWaveform.map((height, i) => (
-                                        <div
-                                            key={i}
-                                            className="waveform-bar flex-1 rounded-full"
-                                            style={{
-                                                height: `${height}%`,
-                                                backgroundColor: '#22D3EE',
-                                                opacity: 0.5 + (height / 200)
-                                            }}
-                                        />
-                                    ))}
-                                </div>
-
-                                {/* Play Button */}
-                                <button
-                                    onClick={() => togglePlay('merged')}
-                                    className="btn-play w-10 h-10 sm:w-11 sm:h-11 rounded-2xl flex items-center justify-center flex-shrink-0"
-                                    style={{ background: 'linear-gradient(145deg, #06B6D4, #22D3EE)' }}
-                                >
-                                    {playingStems['merged'] ? (
-                                        <svg className="w-4 h-4 sm:w-5 sm:h-5 text-white drop-shadow-sm" fill="currentColor" viewBox="0 0 24 24">
-                                            <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" />
-                                        </svg>
-                                    ) : (
-                                        <svg className="w-4 h-4 sm:w-5 sm:h-5 text-white ml-0.5 drop-shadow-sm" fill="currentColor" viewBox="0 0 24 24">
-                                            <path d="M8 5v14l11-7z" />
-                                        </svg>
-                                    )}
-                                </button>
-
-                                {/* Download Button */}
-                                <button
-                                    onClick={() => {
-                                        const a = document.createElement('a');
-                                        a.href = mergedStemUrl;
-                                        a.download = 'merged.wav';
-                                        a.click();
-                                    }}
-                                    className="btn-download w-10 h-10 sm:w-11 sm:h-11 bg-slate-700/80 hover:bg-slate-600 rounded-2xl flex items-center justify-center flex-shrink-0 border border-slate-600 shadow-sm"
-                                >
-                                    <svg className="w-4 h-4 sm:w-5 sm:h-5 text-slate-200" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                                        <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" />
-                                    </svg>
-                                </button>
                             </div>
                         </div>
                     </div>
+                )}
 
-                    <div className="flex flex-wrap items-center justify-center gap-4 mt-6">
+                {/* Separate button - positioned below center */}
+                {audioFile && !hasStemsReady && !separating && (
+                    <div className="absolute inset-0 flex items-center justify-center pointer-events-none" style={{ paddingTop: '620px' }}>
                         <button
-                            onClick={handleBackToStems}
-                            className="px-5 py-2.5 bg-slate-700 hover:bg-slate-600 text-slate-100 font-semibold rounded-xl transition-colors"
+                            onClick={handleSeparate}
+                            disabled={!audioLoaded || modelLoading}
+                            className="btn btn-primary pointer-events-auto animate-fade-in"
                         >
-                            <span className="flex items-center gap-2">
-                                <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-                                    <path d="M10 19l-7-7m0 0l7-7m-7 7h18" />
-                                </svg>
-                                Back to Stems
-                            </span>
+                            {modelLoading ? 'Loading model...' : 'Separate'}
                         </button>
                     </div>
-                </div>
-            )}
+                )}
 
-            {/* Error Popup Modal */}
+                {/* Mixer controls - centered on page when stems ready */}
+                {hasStemsReady && (
+                    <div className="absolute inset-0 flex items-center justify-center animate-fade-in">
+                        <div className="flex flex-col items-center gap-6">
+                            {/* Transport + Time */}
+                            <div className="flex items-center justify-center gap-4">
+                                <div className="lcd-display text-center">
+                                    <div className="lcd-label">Time</div>
+                                    <div className="lcd-time">{formatTime(currentTime)}</div>
+                                </div>
+
+                                <div className="transport">
+                                    <button className="transport-btn" onClick={stopAll} title="Stop">
+                                        <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                                            <rect x="6" y="6" width="12" height="12" />
+                                        </svg>
+                                    </button>
+                                    <button 
+                                        className="transport-btn primary" 
+                                        onClick={isAnyPlaying ? pauseAll : playAll}
+                                    >
+                                        {isAnyPlaying ? (
+                                            <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                                                <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" />
+                                            </svg>
+                                        ) : (
+                                            <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                                                <path d="M8 5v14l11-7z" />
+                                            </svg>
+                                        )}
+                                    </button>
+                                </div>
+
+                                <div className="lcd-display text-center">
+                                    <div className="lcd-label">Duration</div>
+                                    <div className="lcd-time" style={{ color: '#444' }}>{formatTime(duration)}</div>
+                                </div>
+                            </div>
+
+                            {/* Mixer */}
+                            <div className="mixer-console">
+                                <div className="mixer-channels justify-center">
+                                    {stems.map(stemKey => {
+                                        const style = STEM_STYLES[stemKey] || STEM_STYLES.other;
+                                        return (
+                                            <ChannelStrip
+                                                key={stemKey}
+                                                name={style.name}
+                                                color={style.color}
+                                                colorRgb={style.colorRgb}
+                                                volume={volumes[stemKey] ?? 80}
+                                                isPlaying={playingStems[stemKey] || false}
+                                                isMergeMode={mergeMode}
+                                                isSelected={selectedStems.has(stemKey)}
+                                                onVolumeChange={(v) => setVolumes(prev => ({ ...prev, [stemKey]: v }))}
+                                                onTogglePlay={() => togglePlay(stemKey)}
+                                                onDownload={() => handleDownload(stemKey)}
+                                                onToggleSelect={() => toggleStemSelection(stemKey)}
+                                            />
+                                        );
+                                    })}
+                                    {/* Merged stem channel if exists */}
+                                    {mergedStemUrl && (
+                                        <ChannelStrip
+                                            name="Merged"
+                                            color="#c9a227"
+                                            colorRgb="201, 162, 39"
+                                            volume={volumes['merged'] ?? 80}
+                                            isPlaying={playingStems['merged'] || false}
+                                            isMergeMode={false}
+                                            isSelected={false}
+                                            onVolumeChange={(v) => setVolumes(prev => ({ ...prev, merged: v }))}
+                                            onTogglePlay={() => togglePlay('merged')}
+                                            onDownload={() => {
+                                                const a = document.createElement('a');
+                                                a.href = mergedStemUrl;
+                                                a.download = 'merged.wav';
+                                                a.click();
+                                            }}
+                                            onToggleSelect={() => {}}
+                                        />
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Actions */}
+                            <div className="flex flex-wrap justify-center gap-2">
+                                {!mergeMode ? (
+                                    <>
+                                        <button onClick={handleDownloadAll} className="btn btn-primary">
+                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                                                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" />
+                                            </svg>
+                                            Download All
+                                        </button>
+                                        <button onClick={() => setMergeMode(true)} className="btn btn-ghost">
+                                            Merge
+                                        </button>
+                                        <button onClick={resetForNewTrack} className="btn btn-ghost">
+                                            New Track
+                                        </button>
+                                    </>
+                                ) : (
+                                    <>
+                                        <button 
+                                            onClick={handleMergeStems} 
+                                            disabled={selectedStems.size === 0 || isMerging}
+                                            className="btn btn-primary"
+                                        >
+                                            {isMerging ? 'Merging...' : `Merge (${selectedStems.size})`}
+                                        </button>
+                                        <button onClick={() => { setMergeMode(false); setSelectedStems(new Set()); }} className="btn btn-ghost">
+                                            Cancel
+                                        </button>
+                                    </>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                )}
+            </main>
+
+            {/* Error Modal */}
             {audioError && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-                    <div className="bg-slate-800 border border-slate-600 rounded-2xl p-6 max-w-md mx-4 shadow-2xl">
-                        <div className="flex items-start gap-4">
-                            <div className="w-10 h-10 rounded-full bg-red-500/20 flex items-center justify-center flex-shrink-0">
-                                <svg className="w-5 h-5 text-red-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <div className="modal-backdrop" onClick={clearAudioError}>
+                    <div className="modal-content" onClick={e => e.stopPropagation()}>
+                        <div className="flex items-start gap-3 mb-4">
+                            <div className="w-8 h-8 rounded-lg bg-red-500/20 flex items-center justify-center flex-shrink-0">
+                                <svg className="w-4 h-4 text-red-500" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                                     <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
                                 </svg>
                             </div>
-                            <div className="flex-1">
-                                <h3 className="text-lg font-semibold text-slate-100 mb-2">Unable to Load Audio</h3>
-                                <p className="text-slate-300 text-sm">{audioError}</p>
+                            <div>
+                                <h3 className="font-semibold text-white text-sm mb-1">Error</h3>
+                                <p className="text-xs text-[#666]">{audioError}</p>
                             </div>
                         </div>
-                        <div className="mt-6 flex justify-end">
-                            <button
-                                onClick={clearAudioError}
-                                className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-slate-100 font-medium rounded-lg transition-colors"
-                            >
+                        <div className="flex justify-end">
+                            <button onClick={clearAudioError} className="btn btn-ghost text-sm">
                                 Dismiss
                             </button>
                         </div>
                     </div>
                 </div>
             )}
-        </div>
+        </>
     );
 }
