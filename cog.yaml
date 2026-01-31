@@ -13,5 +13,7 @@ build:
     - curl -L -o /root/.demucs/models/e57c48e6.th https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/d12395a8-e57c48e6.th
     - curl -L -o /root/.demucs/models/ef3bcb9c.th https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/92cfc3b6-ef3bcb9c.th
     - curl -L -o /root/.demucs/models/34c22ccb.th https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/5c90dfd2-34c22ccb.th
+    # Install sitecustomize.py to clear LD_LIBRARY_PATH before PyTorch loads
+    - cp sitecustomize.py $(python -c "import site; print(site.getsitepackages()[0])")/sitecustomize.py
 
 predict: "predictor.py:Predictor"
