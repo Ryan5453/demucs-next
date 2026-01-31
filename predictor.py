@@ -4,13 +4,6 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Demucs requires PyTorch 2.9+ but Cog does not support that yet
-# Cog ends up serving us an incorrect version, so we need to force
-# priority for PyTorch's embedded version
-import os
-
-os.environ.pop("LD_LIBRARY_PATH", None)
-
 from io import BytesIO
 
 from cog import BaseModel, BasePredictor, Input, Path
