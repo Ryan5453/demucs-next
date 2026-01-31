@@ -700,9 +700,8 @@ class HDemucs(nn.Module):
         out = m.view(B, S, -1, 2, Fr, T).permute(0, 1, 2, 4, 5, 3)
         out = torch.view_as_complex(out.contiguous())
         return out
-    def forward_core(
-        self, x: Tensor, xt: Tensor
-    ) -> tuple[Tensor, Tensor]:
+
+    def forward_core(self, x: Tensor, xt: Tensor) -> tuple[Tensor, Tensor]:
         """
         Core encoder-decoder processing for ONNX export.
 

@@ -39,6 +39,12 @@ build-backend = "uv_build"
 module-name = "demucs"
 module-root = ""
 
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402"]
+
 [project.scripts]
 demucs = "demucs.cli:main"
 demucs-inference = "demucs.cli:main" # Provided for compatibility with uvx

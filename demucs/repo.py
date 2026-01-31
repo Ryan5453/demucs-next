@@ -6,13 +6,12 @@
 
 
 import json
-import os
 import shutil
 import tempfile
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable, TypeAlias
+from typing import Any, Callable
 
 import httpx
 import torch

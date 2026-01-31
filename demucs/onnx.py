@@ -211,7 +211,6 @@ def export_to_onnx(
             "Install it with: uv pip install demucs-next[onnx]"
         )
 
-
     if output_path is None:
         output_path = f"{model_name}.onnx"
 
