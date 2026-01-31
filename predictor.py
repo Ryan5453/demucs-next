@@ -4,10 +4,15 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+# Demucs requires PyTorch 2.9+ but Cog does not support that yet
+# Cog ends up serving us an incorrect version, so we need to force
+# priority for PyTorch's embedded version
 import os
+
+os.environ.pop("LD_LIBRARY_PATH", None)
+
 from io import BytesIO
 
-import torch
 from cog import BaseModel, BasePredictor, Input, Path
 
 from demucs import ModelRepository, Separator, select_model
@@ -22,14 +27,6 @@ class Predictor(BasePredictor):
     separators: dict[str, "Separator"] = {}
 
     def setup(self) -> None:
-        # Demucs requires PyTorch 2.9+ but Cog does not support that yet
-        # Cog ends up serving us an incorrect version, so we need to force
-        # priority for PyTorch's embedded version
-        torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
-        os.environ["LD_LIBRARY_PATH"] = (
-            f"{torch_lib}:{os.environ.get('LD_LIBRARY_PATH', '')}"
-        )
-
         repo = ModelRepository()
 
         for model_name in repo.list_models().keys():
