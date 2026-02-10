@@ -2,7 +2,7 @@
 name = "demucs-inference"
 version = "1.0.0"
 description = "Audio source separation for music."
-readme = "README.md"
+readme = "readme.md"
 authors = [
     {name = "Alexandre Défossez", email = "defossez@fb.com"},
     {name = "Ryan Fahey", email = "git@ryan.science"}
