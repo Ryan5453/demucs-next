@@ -1,5 +1,5 @@
 [project]
-name = "demucs-inference"
+name = "demucs-next"
 version = "1.0.0"
 description = "Audio source separation for music."
 readme = "readme.md"
