@@ -11,14 +11,25 @@ separator = Separator(
     model: str | Model | ModelEnsemble = "htdemucs", 
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     only_load: str | None = None,
+    load_all: bool = False,
 )
 ```
 
-A `Separator` only takes in three parameters:
+A `Separator` takes the following parameters:
 
 - `model` - The model to use for separation. While just passing in a string is the easiest, you can use `ModelRepository` to load models manually and then pass them in.
 - `device` - The device/backend to use for loading and running the model. Demucs can usually auto-detect the best backend to use based on the availability of the hardware using the heuristic above.
 - `only_load` - Optional, if specified, load only the specialized model for this stem (only applicable to bag-of-models like htdemucs_ft).
+- `load_all` - Optional, if `True`, load all layers of a model ensemble into VRAM immediately. If `False` (default), layers are swapped between CPU and VRAM as needed.
+
+### Attributes
+
+After construction, the following attributes are available on a `Separator` instance:
+
+- `device` - The device being used for processing (`str`).
+- `model` - The loaded model instance (`Model | ModelEnsemble`).
+- `audio_channels` - Number of audio channels the model expects (`int`).
+- `sample_rate` - Sample rate the model operates at (`int`).
 
 Once you have a `Separator` instance, you can use the `separate` method to separate an audio file into its constituent stems.
 
@@ -36,6 +47,7 @@ def separate(
 ```
 
 When separating audio, you have the ability to specify the following parameters:
+
 - `audio` - The audio to separate. Can be a tuple of (Tensor, sample_rate), a file path, or raw audio bytes.
 - `shifts` - The number of random shifts for equivariant stabilization. In simple terms, this is a technique to make the model more robust to small changes in the audio, such as small shifts in time or pitch. More shifts mean generally higher quality separation but also longer processing time.
 - `split` - Whether to split the audio into chunks.
@@ -44,12 +56,17 @@ When separating audio, you have the ability to specify the following parameters:
 - `progress_callback` - A callback function to receive progress updates. View the [Progress Callbacks](#progress-callbacks) section for more information.
 - `use_only_stem` - If specified, perform the separation using only the specialized model for this stem. In most cases you should use `only_load` when creating the `Separator` instance instead of this.
 
-
 ## SeparatedSources
 
 After running `Separator.separate`, you will be returned a `SeparatedSources` instance. This instance contains the separated audio sources, the sample rate of the audio, and the original audio.
 
-If you're happy with the pure audio stems, you have the ability to export them to an audio container (rather than the Tensors that are stored in the `SeparatedSources` instance). 
+### Attributes
+
+- `sources` - Dictionary mapping stem names (e.g. `"vocals"`, `"drums"`) to their audio tensors (`dict[str, Tensor]`). You can iterate the keys to get available stem names.
+- `sample_rate` - Sample rate of the separated audio (`int`), inherited from the model.
+- `original` - The original unseparated audio tensor (`Tensor`).
+
+If you're happy with the pure audio stems, you have the ability to export them to an audio container (rather than the Tensors that are stored in the `SeparatedSources` instance).
 
 ```python
 def export_stem(
@@ -62,6 +79,7 @@ def export_stem(
 ```
 
 When exporting a stem, you have the ability to specify the following parameters:
+
 - `stem_name` - The name of the stem to export.
 - `path` - The path to save the stem to. If not provided, the stem will be returned as raw audio bytes.
 - `format` - The format to export the stem to. Anything supported by FFmpeg.
@@ -85,6 +103,7 @@ def select_model(
 ```
 
 Pass in either the following or a list of the above for the `audio` parameter:
+
 - A tuple of (Tensor, sample_rate)
 - A file path (str or Path)
 - A list of any of the above
@@ -129,6 +148,7 @@ def get_model(self, name: str, only_load: str | None = None, progress_callback: 
 ```
 
 When using the `get_model` method, the following parameters are available:
+
 - `name` - The name of the model to load.
 - `only_load` - Optional, if specified, load only the specialized model for this stem (only applicable to bag-of-models like htdemucs_ft).
 - `progress_callback` - Optional, a callback function to receive progress updates. View the [Progress Callbacks](#progress-callbacks) section for more information.
@@ -185,38 +205,48 @@ def progress_callback(event: str, data: dict[str, Any]) -> Any:
 When using `ModelRepository.get_model` (or creating a `Separator` which calls it internally), the callback receives the following events:
 
 - `download_start`: Fired when the download process begins.
-    - `model_name`: Name of the model being downloaded.
-    - `total_layers`: Total number of layers to download.
+  - `model_name`: Name of the model being downloaded.
+  - `total_layers`: Total number of layers to download.
 - `layer_start`: Fired when a specific layer starts downloading.
-    - `model_name`: Name of the model.
-    - `layer_index`: Index of the current layer (1-based).
-    - `total_layers`: Total number of layers.
-    - `layer_size_bytes`: Size of the layer in bytes.
+  - `model_name`: Name of the model.
+  - `layer_index`: Index of the current layer (1-based).
+  - `total_layers`: Total number of layers.
+  - `layer_size_bytes`: Size of the layer in bytes.
 - `layer_progress`: Fired periodically during download and loading.
-    - `model_name`: Name of the model.
-    - `layer_index`: Index of the current layer.
-    - `total_layers`: Total number of layers.
-    - `progress_percent`: Percentage complete (0-100).
-    - `downloaded_bytes`: Bytes downloaded so far.
-    - `total_bytes`: Total bytes to download.
-    - `phase`: Optional. Can be "loading" or "verifying" during those stages.
+  - `model_name`: Name of the model.
+  - `layer_index`: Index of the current layer.
+  - `total_layers`: Total number of layers.
+  - `progress_percent`: Percentage complete (0-100).
+  - `downloaded_bytes`: Bytes downloaded so far.
+  - `total_bytes`: Total bytes to download.
+  - `phase`: Optional. Can be "loading" or "verifying" during those stages.
 - `layer_complete`: Fired when a layer is successfully loaded and cached.
-    - `model_name`: Name of the model.
-    - `layer_index`: Index of the current layer.
-    - `total_layers`: Total number of layers.
-    - `cached`: Optional. True if the layer was found in cache.
+  - `model_name`: Name of the model.
+  - `layer_index`: Index of the current layer.
+  - `total_layers`: Total number of layers.
+  - `cached`: Optional. True if the layer was found in cache.
 - `download_complete`: Fired when all layers are downloaded and loaded.
-    - `model_name`: Name of the model.
-    - `total_layers`: Total number of layers.
+  - `model_name`: Name of the model.
+  - `total_layers`: Total number of layers.
 
 ### Audio Separation
 
 When using `Separator.separate`, the callback receives the following events (only if `split=True`):
 
 - `processing_start`: Fired before processing chunks.
-    - `total_chunks`: Total number of chunks to process.
+  - `total_chunks`: Total number of chunks to process.
 - `chunk_complete`: Fired after each chunk is processed.
-    - `completed_chunks`: Number of chunks completed so far.
-    - `total_chunks`: Total number of chunks.
+  - `completed_chunks`: Number of chunks completed so far.
+  - `total_chunks`: Total number of chunks.
 - `processing_complete`: Fired after all chunks are processed.
-    - `total_chunks`: Total number of chunks.
+  - `total_chunks`: Total number of chunks.
+
+## Version
+
+You can get the version of the `demucs` package you have installed:
+
+```python
+def get_version() -> str:
+```
+
+Returns the version string (e.g. `"5.0.0"`).
