@@ -208,7 +208,6 @@ export function computeISTFT(
     targetLength: number,
     buffers: ISTFTBuffers
 ): Float32Array {
-    const paddedBins = numBins + 1;
     const paddedFrames = numFrames + 4;
     const { output, windowSumReciprocal, finalOutput, ifftInput, ifftOutput } = buffers;
 

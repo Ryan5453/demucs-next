@@ -100,5 +100,5 @@ self.onmessage = (event: MessageEvent<ISTFTMessage>) => {
     };
 
     // Transfer ownership of chunk buffers to avoid copying
-    self.postMessage(response, chunks.map(c => c.buffer) as unknown as Transferable[]);
+    self.postMessage(response, { transfer: chunks.map(c => c.buffer) as unknown as Transferable[] });
 };

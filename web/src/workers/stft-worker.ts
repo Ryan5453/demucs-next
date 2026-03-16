@@ -41,5 +41,5 @@ self.onmessage = (event: MessageEvent<STFTMessage>) => {
     };
 
     // Transfer ownership to avoid copying
-    self.postMessage(response, [real.buffer, imag.buffer] as unknown as Transferable[]);
+    self.postMessage(response, { transfer: [real.buffer, imag.buffer] as unknown as Transferable[] });
 };
