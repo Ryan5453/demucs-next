@@ -29,7 +29,6 @@ let usingWorker = false;
 const MODEL_URLS: Record<ModelType, string> = {
     'htdemucs': 'https://huggingface.co/Ryan5453/demucs-onnx/resolve/main/htdemucs.onnx',
     'htdemucs_6s': 'https://huggingface.co/Ryan5453/demucs-onnx/resolve/main/htdemucs_6s.onnx',
-    'hdemucs_mmi': 'https://huggingface.co/Ryan5453/demucs-onnx/resolve/main/hdemucs_mmi.onnx',
 };
 
 
@@ -38,7 +37,6 @@ const MODEL_URLS: Record<ModelType, string> = {
 const MODEL_SOURCES: Record<ModelType, string[]> = {
     'htdemucs': ['drums', 'bass', 'other', 'vocals'],
     'htdemucs_6s': ['drums', 'bass', 'guitar', 'piano', 'other', 'vocals'],
-    'hdemucs_mmi': ['drums', 'bass', 'other', 'vocals'],
 };
 
 /**
@@ -90,18 +88,13 @@ export async function loadModel(
         // Check WebGPU availability
         const hasWebGPU = await isWebGPUAvailable();
 
-        // HDemucs (v3) uses bidirectional LSTMs which aren't supported on WebGPU
-        // So we must use WASM-only for that model
-        const requiresWasmOnly = model === 'hdemucs_mmi';
-        
-        // Use WebGPU only if: user prefers it, it's available, and model supports it
-        const useWebGPU = preferredBackend === 'webgpu' && hasWebGPU && !requiresWasmOnly;
+        // Use WebGPU only if: user prefers it and it's available
+        const useWebGPU = preferredBackend === 'webgpu' && hasWebGPU;
 
         const modelUrl = MODEL_URLS[model];
 
         console.log('[ONNX] Preferred backend:', preferredBackend);
         console.log('[ONNX] WebGPU available:', hasWebGPU);
-        console.log('[ONNX] Model requires WASM only:', requiresWasmOnly);
         console.log('[ONNX] Using WebGPU:', useWebGPU);
         console.log('[ONNX] Model URL:', modelUrl);
 

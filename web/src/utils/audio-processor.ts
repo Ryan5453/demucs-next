@@ -45,7 +45,7 @@ export interface STFTBuffers {
  */
 export interface ISTFTBuffers {
     output: Float32Array;
-    windowSum: Float32Array;
+    windowSumReciprocal: Float32Array;
     finalOutput: Float32Array;
     ifftInput: number[];
     ifftOutput: number[];
@@ -74,12 +74,32 @@ export function createSTFTBuffers(): STFTBuffers {
 }
 
 /**
- * Create reusable ISTFT buffers - call once before processing loop
+ * Create reusable ISTFT buffers - call once before processing loop.
+ * Precomputes the window sum reciprocal since it's identical for every ISTFT call.
  */
 export function createISTFTBuffers(): ISTFTBuffers {
+    const paddedFrames = OUT_FRAMES + 4;
+    const hopLength = HOP_LENGTH;
+    const nfft = NFFT;
+
+    const windowSum = new Float32Array(ISTFT_LE);
+    for (let fp = 0; fp < paddedFrames; fp++) {
+        const frameStart = fp * hopLength;
+        for (let i = 0; i < nfft; i++) {
+            const outIdx = frameStart + i - nfft / 2;
+            if (outIdx >= 0 && outIdx < ISTFT_LE) {
+                windowSum[outIdx] += hannWindow[i] * hannWindow[i];
+            }
+        }
+    }
+    const windowSumReciprocal = new Float32Array(ISTFT_LE);
+    for (let i = 0; i < ISTFT_LE; i++) {
+        windowSumReciprocal[i] = windowSum[i] > 1e-8 ? 1.0 / windowSum[i] : 0;
+    }
+
     return {
         output: new Float32Array(NUM_CHANNELS * ISTFT_LE),
-        windowSum: new Float32Array(ISTFT_LE),
+        windowSumReciprocal,
         finalOutput: new Float32Array(NUM_CHANNELS * SEGMENT_SAMPLES),
         ifftInput: fftInstance.createComplexArray(),
         ifftOutput: fftInstance.createComplexArray(),
@@ -105,7 +125,6 @@ export function computeSTFT(audio: Float32Array, buffers: STFTBuffers): STFTResu
     const numSamples = audio.length / NUM_CHANNELS;
     const { demucs_padded, paddedChannels, real, imag, outReal, outImag, fftInput, fftOutput } = buffers;
 
-    // Clear buffers
     demucs_padded[0].fill(0);
     demucs_padded[1].fill(0);
     paddedChannels[0].fill(0);
@@ -191,71 +210,70 @@ export function computeISTFT(
 ): Float32Array {
     const paddedBins = numBins + 1;
     const paddedFrames = numFrames + 4;
-    const { output, windowSum, finalOutput, ifftInput, ifftOutput } = buffers;
+    const { output, windowSumReciprocal, finalOutput, ifftInput, ifftOutput } = buffers;
 
-    // Clear buffers
     output.fill(0);
-    windowSum.fill(0);
-    finalOutput.fill(0);
 
     const nfft = NFFT;
+    const halfNfft = nfft / 2;
     const hopLength = HOP_LENGTH;
     const scale = Math.sqrt(nfft);
+    const channelStride = numBins * numFrames;
 
     for (let c = 0; c < numChannels; c++) {
+        const cBase = c * channelStride;
+        const outBase = c * ISTFT_LE;
+
         for (let fp = 0; fp < paddedFrames; fp++) {
             const f = fp - 2;
+            const frameStart = fp * hopLength;
+            const overlapStart = Math.max(0, halfNfft - frameStart);
+            const overlapEnd = Math.min(nfft, ISTFT_LE - frameStart + halfNfft);
 
-            for (let i = 0; i < nfft * 2; i++) {
-                ifftInput[i] = 0;
-            }
+            if (f >= 0 && f < numFrames) {
+                const dcIdx = cBase + f;
+                ifftInput[0] = real[dcIdx] * scale;
+                ifftInput[1] = imag[dcIdx] * scale;
 
-            for (let b = 0; b < paddedBins; b++) {
-                let realVal = 0, imagVal = 0;
-
-                if (f >= 0 && f < numFrames && b < numBins) {
-                    const srcIdx = c * numBins * numFrames + b * numFrames + f;
-                    realVal = real[srcIdx];
-                    imagVal = imag[srcIdx];
+                for (let b = 1; b < numBins; b++) {
+                    const srcIdx = cBase + b * numFrames + f;
+                    const rv = real[srcIdx] * scale;
+                    const iv = imag[srcIdx] * scale;
+                    ifftInput[b * 2] = rv;
+                    ifftInput[b * 2 + 1] = iv;
+                    const negIdx = nfft - b;
+                    ifftInput[negIdx * 2] = rv;
+                    ifftInput[negIdx * 2 + 1] = -iv;
                 }
 
-                ifftInput[b * 2] = realVal * scale;
-                ifftInput[b * 2 + 1] = imagVal * scale;
-            }
-
-            for (let b = 1; b < paddedBins - 1; b++) {
-                const negIdx = nfft - b;
-                ifftInput[negIdx * 2] = ifftInput[b * 2];
-                ifftInput[negIdx * 2 + 1] = -ifftInput[b * 2 + 1];
+                ifftInput[numBins * 2] = 0;
+                ifftInput[numBins * 2 + 1] = 0;
+            } else {
+                for (let b = 0; b <= numBins; b++) {
+                    ifftInput[b * 2] = 0;
+                    ifftInput[b * 2 + 1] = 0;
+                }
+                for (let b = 1; b < numBins; b++) {
+                    const negIdx = nfft - b;
+                    ifftInput[negIdx * 2] = 0;
+                    ifftInput[negIdx * 2 + 1] = 0;
+                }
             }
 
             fftInstance.inverseTransform(ifftOutput, ifftInput);
 
-            const frameStart = fp * hopLength;
-            for (let i = 0; i < nfft; i++) {
-                const outIdx = frameStart + i - nfft / 2;
-                if (outIdx >= 0 && outIdx < ISTFT_LE) {
-                    const sample = ifftOutput[i * 2] * hannWindow[i];
-                    output[c * ISTFT_LE + outIdx] += sample;
-                    if (c === 0) {
-                        windowSum[outIdx] += hannWindow[i] * hannWindow[i];
-                    }
-                }
+            for (let i = overlapStart; i < overlapEnd; i++) {
+                const outIdx = frameStart + i - halfNfft;
+                output[outBase + outIdx] += ifftOutput[i * 2] * hannWindow[i];
             }
         }
     }
 
     for (let c = 0; c < numChannels; c++) {
-        for (let i = 0; i < ISTFT_LE; i++) {
-            if (windowSum[i] > 1e-8) {
-                output[c * ISTFT_LE + i] /= windowSum[i];
-            }
-        }
-    }
-
-    for (let c = 0; c < numChannels; c++) {
+        const outBase = c * ISTFT_LE;
+        const finalBase = c * targetLength;
         for (let i = 0; i < targetLength; i++) {
-            finalOutput[c * targetLength + i] = output[c * ISTFT_LE + ISTFT_PAD + i];
+            finalOutput[finalBase + i] = output[outBase + ISTFT_PAD + i] * windowSumReciprocal[ISTFT_PAD + i];
         }
     }
 

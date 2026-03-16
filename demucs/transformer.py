@@ -7,67 +7,108 @@
 
 import math
 import random
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
+@torch.no_grad()
 def create_sin_embedding(
-    length: int, dim: int, shift: int = 0, device="cpu", max_period=10000
-):
+    length: int, dim: int, shift: int = 0, device: str = "cpu", max_period: float = 10000
+) -> torch.Tensor:
+    """
+    Create sinusoidal positional embedding in TBC format.
+
+    :param length: Sequence length
+    :param dim: Embedding dimension (must be even)
+    :param shift: Position offset
+    :param device: Device to create tensor on
+    :param max_period: Maximum period for sinusoidal encoding
+    :return: Positional embedding tensor of shape (length, 1, dim)
+    """
     # We aim for TBC format
     assert dim % 2 == 0
-    pos = shift + torch.arange(length, device=device).view(-1, 1, 1)
-    half_dim = dim // 2
-    adim = torch.arange(dim // 2, device=device).view(1, 1, -1)
-    phase = pos / (max_period ** (adim / (half_dim - 1)))
-    return torch.cat(
-        [
-            torch.cos(phase),
-            torch.sin(phase),
-        ],
-        dim=-1,
-    )
+    # Force FP32 for numerical stability — exponentiation of max_period overflows in FP16
+    with torch.autocast(device_type=str(device).split(":")[0], enabled=False):
+        pos = shift + torch.arange(length, device=device, dtype=torch.float32).view(
+            -1, 1, 1
+        )
+        half_dim = dim // 2
+        adim = torch.arange(dim // 2, device=device, dtype=torch.float32).view(
+            1, 1, -1
+        )
+        phase = pos / (max_period ** (adim / (half_dim - 1)))
+        return torch.cat(
+            [
+                torch.cos(phase),
+                torch.sin(phase),
+            ],
+            dim=-1,
+        )
 
 
-def create_2d_sin_embedding(d_model, height, width, device="cpu", max_period=10000):
+@torch.no_grad()
+def create_2d_sin_embedding(
+    d_model: int, height: int, width: int, device: str = "cpu", max_period: float = 10000
+) -> torch.Tensor:
     """
-    :param d_model: dimension of the model
-    :param height: height of the positions
-    :param width: width of the positions
-    :return: d_model*height*width position matrix
+    Create 2D sinusoidal positional embedding.
+
+    :param d_model: Dimension of the model (must be divisible by 4)
+    :param height: Height of the positions
+    :param width: Width of the positions
+    :param device: Device to create tensor on
+    :param max_period: Maximum period for sinusoidal encoding
+    :return: Positional embedding tensor of shape (1, d_model, height, width)
+    :raises ValueError: If d_model is not divisible by 4
     """
     if d_model % 4 != 0:
         raise ValueError(
             "Cannot use sin/cos positional encoding with "
             "odd dimension (got dim={:d})".format(d_model)
         )
-    pe = torch.zeros(d_model, height, width)
-    # Each dimension use half of d_model
-    d_model = int(d_model / 2)
-    div_term = torch.exp(
-        torch.arange(0.0, d_model, 2) * -(math.log(max_period) / d_model)
-    )
-    pos_w = torch.arange(0.0, width).unsqueeze(1)
-    pos_h = torch.arange(0.0, height).unsqueeze(1)
-    pe[0:d_model:2, :, :] = (
-        torch.sin(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, height, 1)
-    )
-    pe[1:d_model:2, :, :] = (
-        torch.cos(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, height, 1)
-    )
-    pe[d_model::2, :, :] = (
-        torch.sin(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, width)
-    )
-    pe[d_model + 1 :: 2, :, :] = (
-        torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, width)
-    )
+    # Force FP32 for numerical stability — exp/sin/cos of large values overflow in FP16
+    with torch.autocast(device_type=str(device).split(":")[0], enabled=False):
+        pe = torch.zeros(d_model, height, width, dtype=torch.float32)
+        # Each dimension use half of d_model
+        d_model = int(d_model / 2)
+        div_term = torch.exp(
+            torch.arange(0.0, d_model, 2, dtype=torch.float32)
+            * -(math.log(max_period) / d_model)
+        )
+        pos_w = torch.arange(0.0, width, dtype=torch.float32).unsqueeze(1)
+        pos_h = torch.arange(0.0, height, dtype=torch.float32).unsqueeze(1)
+        pe[0:d_model:2, :, :] = (
+            torch.sin(pos_w * div_term)
+            .transpose(0, 1)
+            .unsqueeze(1)
+            .repeat(1, height, 1)
+        )
+        pe[1:d_model:2, :, :] = (
+            torch.cos(pos_w * div_term)
+            .transpose(0, 1)
+            .unsqueeze(1)
+            .repeat(1, height, 1)
+        )
+        pe[d_model::2, :, :] = (
+            torch.sin(pos_h * div_term)
+            .transpose(0, 1)
+            .unsqueeze(2)
+            .repeat(1, 1, width)
+        )
+        pe[d_model + 1 :: 2, :, :] = (
+            torch.cos(pos_h * div_term)
+            .transpose(0, 1)
+            .unsqueeze(2)
+            .repeat(1, 1, width)
+        )
 
-    return pe[None, :].to(device)
+        return pe[None, :].to(device)
 
 
+@torch.no_grad()
 def create_sin_embedding_cape(
     length: int,
     dim: int,
@@ -79,26 +120,45 @@ def create_sin_embedding_cape(
     max_scale: float = 1.0,
     device: str = "cpu",
     max_period: float = 10000.0,
-):
+) -> torch.Tensor:
+    """
+    Create sinusoidal positional embedding with CAPE augmentation.
+
+    :param length: Sequence length
+    :param dim: Embedding dimension (must be even)
+    :param batch_size: Batch size
+    :param mean_normalize: Whether to mean-normalize positions
+    :param augment: Whether to apply CAPE augmentation (typically True during training)
+    :param max_global_shift: Maximum global position shift (delta max)
+    :param max_local_shift: Maximum local position shift (epsilon max)
+    :param max_scale: Maximum scaling factor
+    :param device: Device to create tensor on
+    :param max_period: Maximum period for sinusoidal encoding
+    :return: Positional embedding tensor of shape (length, batch_size, dim)
+    """
     # We aim for TBC format
     assert dim % 2 == 0
-    pos = 1.0 * torch.arange(length).view(-1, 1, 1)  # (length, 1, 1)
-    pos = pos.repeat(1, batch_size, 1)  # (length, batch_size, 1)
-    if mean_normalize:
-        pos -= torch.nanmean(pos, dim=0, keepdim=True)
+    # Force FP32 for numerical stability
+    with torch.autocast(device_type=str(device).split(":")[0], enabled=False):
+        pos = torch.arange(length, dtype=torch.float32).view(-1, 1, 1)
+        pos = pos.repeat(1, batch_size, 1)  # (length, batch_size, 1)
+        if mean_normalize:
+            pos -= torch.nanmean(pos, dim=0, keepdim=True)
 
-    pos = pos.to(device)
+        pos = pos.to(device)
 
-    half_dim = dim // 2
-    adim = torch.arange(dim // 2, device=device).view(1, 1, -1)
-    phase = pos / (max_period ** (adim / (half_dim - 1)))
-    return torch.cat(
-        [
-            torch.cos(phase),
-            torch.sin(phase),
-        ],
-        dim=-1,
-    ).float()
+        half_dim = dim // 2
+        adim = torch.arange(dim // 2, device=device, dtype=torch.float32).view(
+            1, 1, -1
+        )
+        phase = pos / (max_period ** (adim / (half_dim - 1)))
+        return torch.cat(
+            [
+                torch.cos(phase),
+                torch.sin(phase),
+            ],
+            dim=-1,
+        )
 
 
 class ScaledEmbedding(nn.Module):
@@ -108,7 +168,15 @@ class ScaledEmbedding(nn.Module):
         embedding_dim: int,
         scale: float = 1.0,
         boost: float = 3.0,
-    ):
+    ) -> None:
+        """
+        Embedding with a learnable scale factor applied via boost.
+
+        :param num_embeddings: Size of the embedding dictionary
+        :param embedding_dim: Size of each embedding vector
+        :param scale: Initial scale for embedding weights
+        :param boost: Multiplicative boost applied during forward pass
+        """
         super().__init__()
         self.embedding = nn.Embedding(num_embeddings, embedding_dim)
         self.embedding.weight.data *= scale / boost
@@ -118,7 +186,13 @@ class ScaledEmbedding(nn.Module):
     def weight(self):
         return self.embedding.weight * self.boost
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Look up embeddings and apply boost scaling.
+
+        :param x: Input indices tensor
+        :return: Scaled embedding tensor
+        """
         return self.embedding(x) * self.boost
 
 
@@ -127,17 +201,26 @@ class LayerScale(nn.Module):
     This rescales diagonaly residual outputs close to 0 initially, then learnt.
     """
 
-    def __init__(self, channels: int, init: float = 0, channel_last=False):
+    def __init__(self, channels: int, init: float = 0, channel_last: bool = False) -> None:
         """
-        channel_last = False corresponds to (B, C, T) tensors
-        channel_last = True corresponds to (T, B, C) tensors
+        Initialize learnable diagonal rescaling for residual outputs.
+
+        :param channels: Number of channels to scale
+        :param init: Initial value for scale parameters
+        :param channel_last: If False, expects (B, C, T) tensors; if True, expects (T, B, C)
         """
         super().__init__()
         self.channel_last = channel_last
         self.scale = nn.Parameter(torch.zeros(channels, requires_grad=True))
         self.scale.data[:] = init
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply learned diagonal scaling to input.
+
+        :param x: Input tensor
+        :return: Scaled tensor
+        """
         if self.channel_last:
             return self.scale * x
         else:
@@ -145,13 +228,18 @@ class LayerScale(nn.Module):
 
 
 class MyGroupNorm(nn.GroupNorm):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """
+        GroupNorm variant that handles (B, T, C) input by transposing internally.
+        """
         super().__init__(*args, **kwargs)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x: (B, T, C)
-        if num_groups=1: Normalisation on all T and C together for each B
+        Apply group normalization on (B, T, C) input.
+
+        :param x: Input tensor of shape (B, T, C)
+        :return: Normalized tensor of shape (B, T, C)
         """
         x = x.transpose(1, 2)
         return super().forward(x).transpose(1, 2)
@@ -160,21 +248,39 @@ class MyGroupNorm(nn.GroupNorm):
 class MyTransformerEncoderLayer(nn.TransformerEncoderLayer):
     def __init__(
         self,
-        d_model,
-        nhead,
-        dim_feedforward=2048,
-        dropout=0.1,
-        activation=F.relu,
-        group_norm=0,
-        norm_first=False,
-        norm_out=False,
-        layer_norm_eps=1e-5,
-        layer_scale=False,
-        init_values=1e-4,
-        device=None,
-        dtype=None,
-        batch_first=False,
-    ):
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        activation: Any = F.relu,
+        group_norm: int = 0,
+        norm_first: bool = False,
+        norm_out: bool = False,
+        layer_norm_eps: float = 1e-5,
+        layer_scale: bool = False,
+        init_values: float = 1e-4,
+        device: Any = None,
+        dtype: Any = None,
+        batch_first: bool = False,
+    ) -> None:
+        """
+        Transformer encoder layer with optional group norm, layer scale, and norm_out.
+
+        :param d_model: Model dimension
+        :param nhead: Number of attention heads
+        :param dim_feedforward: Feedforward hidden dimension
+        :param dropout: Dropout rate
+        :param activation: Activation function
+        :param group_norm: Number of groups for group norm (0 to disable)
+        :param norm_first: If True, apply norm before attention/FF blocks
+        :param norm_out: If True and norm_first, apply output normalization
+        :param layer_norm_eps: Epsilon for layer normalization
+        :param layer_scale: If True, use LayerScale on residual outputs
+        :param init_values: Initial values for LayerScale
+        :param device: Device for parameters
+        :param dtype: Data type for parameters
+        :param batch_first: If True, input is (B, T, C) instead of (T, B, C)
+        """
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(
             d_model=d_model,
@@ -206,10 +312,19 @@ class MyTransformerEncoderLayer(nn.TransformerEncoderLayer):
             LayerScale(d_model, init_values, True) if layer_scale else nn.Identity()
         )
 
-    def forward(self, src, src_mask=None, src_key_padding_mask=None):
+    def forward(
+        self,
+        src: torch.Tensor,
+        src_mask: torch.Tensor | None = None,
+        src_key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
-        if batch_first = False, src shape is (T, B, C)
-        the case where batch_first=True is not covered
+        Forward pass through the transformer encoder layer.
+
+        :param src: Source tensor of shape (T, B, C) when batch_first=False
+        :param src_mask: Attention mask tensor
+        :param src_key_padding_mask: Key padding mask tensor
+        :return: Transformed tensor of same shape as src
         """
         x = src
 
@@ -237,17 +352,35 @@ class CrossTransformerEncoderLayer(nn.Module):
         nhead: int,
         dim_feedforward: int = 2048,
         dropout: float = 0.1,
-        activation=F.relu,
+        activation: Any = F.relu,
         layer_norm_eps: float = 1e-5,
         layer_scale: bool = False,
         init_values: float = 1e-4,
         norm_first: bool = False,
         group_norm: bool = False,
         norm_out: bool = False,
-        device=None,
-        dtype=None,
-        batch_first=False,
-    ):
+        device: Any = None,
+        dtype: Any = None,
+        batch_first: bool = False,
+    ) -> None:
+        """
+        Cross-attention transformer encoder layer with optional group norm and layer scale.
+
+        :param d_model: Model dimension
+        :param nhead: Number of attention heads
+        :param dim_feedforward: Feedforward hidden dimension
+        :param dropout: Dropout rate
+        :param activation: Activation function or string name
+        :param layer_norm_eps: Epsilon for layer normalization
+        :param layer_scale: If True, use LayerScale on residual outputs
+        :param init_values: Initial values for LayerScale
+        :param norm_first: If True, apply norm before attention/FF blocks
+        :param group_norm: If True, use group norm instead of layer norm
+        :param norm_out: If True and norm_first, apply output normalization
+        :param device: Device for parameters
+        :param dtype: Data type for parameters
+        :param batch_first: If True, input is (B, T, C) instead of (T, B, C)
+        """
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
 
@@ -299,13 +432,16 @@ class CrossTransformerEncoderLayer(nn.Module):
         else:
             self.activation = activation
 
-    def forward(self, q, k, mask=None):
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """
-        Args:
-            q: tensor of shape (T, B, C)
-            k: tensor of shape (S, B, C)
-            mask: tensor of shape (T, S)
+        Forward pass with cross-attention between query and key sequences.
 
+        :param q: Query tensor of shape (T, B, C)
+        :param k: Key tensor of shape (S, B, C)
+        :param mask: Attention mask tensor of shape (T, S)
+        :return: Transformed tensor of same shape as q
         """
         if self.norm_first:
             x = q + self.gamma_1(self._ca_block(self.norm1(q), self.norm2(k), mask))
@@ -318,17 +454,38 @@ class CrossTransformerEncoderLayer(nn.Module):
 
         return x
 
-    # cross-attention block
-    def _ca_block(self, q, k, attn_mask=None):
+    def _ca_block(
+        self, q: torch.Tensor, k: torch.Tensor, attn_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """
+        Cross-attention block.
+
+        :param q: Query tensor
+        :param k: Key/value tensor
+        :param attn_mask: Optional attention mask
+        :return: Cross-attended tensor with dropout applied
+        """
         x = self.cross_attn(q, k, k, attn_mask=attn_mask, need_weights=False)[0]
         return self.dropout1(x)
 
-    # feed forward block
-    def _ff_block(self, x):
+    def _ff_block(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Feed-forward block.
+
+        :param x: Input tensor
+        :return: Transformed tensor with dropout applied
+        """
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))
         return self.dropout2(x)
 
-    def _get_activation_fn(self, activation):
+    def _get_activation_fn(self, activation: str) -> Callable:
+        """
+        Return the activation function corresponding to the given name.
+
+        :param activation: Name of activation function ("relu" or "gelu")
+        :return: The activation function
+        :raises RuntimeError: If activation name is not recognized
+        """
         if activation == "relu":
             return F.relu
         elif activation == "gelu":
@@ -353,7 +510,7 @@ class CrossTransformerEncoder(nn.Module):
         max_positions: int = 1000,
         norm_in: bool = True,
         norm_in_group: bool = False,
-        group_norm: int = False,
+        group_norm: int = 0,
         norm_first: bool = False,
         norm_out: bool = False,
         max_period: float = 10000.0,
@@ -365,11 +522,36 @@ class CrossTransformerEncoder(nn.Module):
         weight_pos_embed: float = 1.0,
         cape_mean_normalize: bool = True,
         cape_augment: bool = True,
-        cape_glob_loc_scale: list = [5000.0, 1.0, 1.4],
-    ):
+        cape_glob_loc_scale: list[float] = [5000.0, 1.0, 1.4],
+    ) -> None:
+        """
+        Cross-transformer encoder alternating self-attention and cross-attention layers.
+
+        :param dim: Model dimension
+        :param emb: Positional embedding type ("sin", "cape", or "scaled")
+        :param hidden_scale: Feedforward hidden dim multiplier
+        :param num_heads: Number of attention heads
+        :param num_layers: Number of transformer layers
+        :param cross_first: If True, start with cross-attention layer
+        :param dropout: Dropout rate
+        :param max_positions: Maximum sequence length for scaled embeddings
+        :param norm_in: If True, apply LayerNorm to inputs
+        :param norm_in_group: If True, use GroupNorm for input normalization
+        :param group_norm: Number of groups for group norm (0 to disable)
+        :param norm_first: If True, apply norm before attention/FF blocks
+        :param norm_out: If True and norm_first, apply output normalization
+        :param max_period: Maximum period for sinusoidal encoding
+        :param weight_decay: Weight decay for optimizer
+        :param lr: Learning rate override (None to use default)
+        :param layer_scale: If True, use LayerScale on residual outputs
+        :param gelu: If True, use GELU activation; otherwise ReLU
+        :param sin_random_shift: Maximum random shift for sinusoidal embeddings
+        :param weight_pos_embed: Weight for positional embedding contribution
+        :param cape_mean_normalize: Whether to mean-normalize CAPE positions
+        :param cape_augment: Whether to augment CAPE positions
+        :param cape_glob_loc_scale: CAPE global/local scale parameters
+        """
         super().__init__()
-        """
-        """
         assert dim % num_heads == 0
 
         hidden_dim = int(dim * hidden_scale)
@@ -434,24 +616,31 @@ class CrossTransformerEncoder(nn.Module):
 
                 self.layers_t.append(CrossTransformerEncoderLayer(**kwargs_common))
 
-    def forward(self, x, xt):
+    def forward(self, x: torch.Tensor, xt: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass through alternating self-attention and cross-attention layers.
+
+        :param x: Spectrogram tensor of shape (B, C, Fr, T1)
+        :param xt: Temporal tensor of shape (B, C, T2)
+        :return: Tuple of transformed (spectrogram, temporal) tensors
+        """
         B, C, Fr, T1 = x.shape
         pos_emb_2d = create_2d_sin_embedding(
             C, Fr, T1, x.device, self.max_period
         )  # (1, C, Fr, T1)
-        pos_emb_2d = pos_emb_2d.permute(0, 2, 3, 1).reshape(
-            B, T1 * Fr, C
-        )  # "b c fr t1 -> b (t1 fr) c"
-        x = x.permute(0, 2, 3, 1).reshape(B, T1 * Fr, C)  # "b c fr t1 -> b (t1 fr) c"
+        pos_emb_2d = pos_emb_2d.permute(0, 3, 2, 1).reshape(
+            1, T1 * Fr, C
+        )  # "1 c fr t1 -> 1 (t1 fr) c", broadcasts over batch
+        x = x.permute(0, 3, 2, 1).reshape(B, T1 * Fr, C)  # "b c fr t1 -> b (t1 fr) c"
         x = self.norm_in(x)
-        x = x + self.weight_pos_embed * pos_emb_2d
+        x = x + self.weight_pos_embed * pos_emb_2d.to(x.dtype)
 
         B, C, T2 = xt.shape
         xt = xt.permute(0, 2, 1)  # "b c t2 -> b t2 c"
         pos_emb = self._get_pos_embedding(T2, B, C, x.device)
         pos_emb = pos_emb.permute(1, 0, 2)  # "t2 b c -> b t2 c"
         xt = self.norm_in_t(xt)
-        xt = xt + self.weight_pos_embed * pos_emb
+        xt = xt + self.weight_pos_embed * pos_emb.to(xt.dtype)
 
         for idx in range(self.num_layers):
             if idx % 2 == self.classic_parity:
@@ -466,7 +655,16 @@ class CrossTransformerEncoder(nn.Module):
         xt = xt.permute(0, 2, 1)  # "b t2 c -> b c t2"
         return x, xt
 
-    def _get_pos_embedding(self, T, B, C, device):
+    def _get_pos_embedding(self, T: int, B: int, C: int, device: torch.device | str) -> torch.Tensor:
+        """
+        Compute positional embedding based on the configured embedding type.
+
+        :param T: Sequence length
+        :param B: Batch size
+        :param C: Embedding dimension
+        :param device: Device to create tensor on
+        :return: Positional embedding tensor
+        """
         if self.emb == "sin":
             shift = random.randrange(self.sin_random_shift + 1)
             pos_emb = create_sin_embedding(

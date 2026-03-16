@@ -14,7 +14,6 @@ class DeviceType(str, Enum):
 
 class ModelName(str, Enum):
     auto = "auto"
-    hdemucs_mmi = "hdemucs_mmi"
     htdemucs = "htdemucs"
     htdemucs_ft = "htdemucs_ft"
     htdemucs_6s = "htdemucs_6s"

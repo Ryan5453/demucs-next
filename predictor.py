@@ -17,15 +17,20 @@ class Output(BaseModel):
 
 
 class Predictor(BasePredictor):
+    """Cog predictor for Demucs audio source separation."""
+
     separators: dict[str, "Separator"] = {}
 
     def setup(self) -> None:
+        """
+        Load all available models into memory for fast inference.
+        """
         repo = ModelRepository()
 
         for model_name in repo.list_models().keys():
             separator = Separator(
                 model=model_name,
-                load_all=True,
+                compile=True,
             )
             self.separators[model_name] = separator
 
@@ -37,7 +42,6 @@ class Predictor(BasePredictor):
             default="auto",
             choices=[
                 "auto",
-                "hdemucs_mmi",
                 "htdemucs",
                 "htdemucs_ft",
                 "htdemucs_6s",
@@ -87,9 +91,22 @@ class Predictor(BasePredictor):
             choices=["none", "rescale", "clamp", "tanh"],
         ),
     ) -> Output:
+        """
+        Separate audio sources from the input file.
+
+        :param audio: Path to the audio file to separate
+        :param model: Model name or "auto" for automatic selection
+        :param format: Output audio format
+        :param isolate_stem: Stem to isolate, or "none" for all stems
+        :param shifts: Number of random shifts for equivariant stabilization
+        :param split: Whether to split audio into chunks
+        :param split_size: Chunk size in seconds
+        :param split_overlap: Overlap between chunks
+        :param clip_mode: Clipping prevention strategy
+        :return: Output object with separated audio stems
+        """
         if model == "auto":
             model, _ = select_model(
-                audio=audio,
                 isolate_stem=None if isolate_stem == "none" else isolate_stem,
             )
         separator = self.separators[model]

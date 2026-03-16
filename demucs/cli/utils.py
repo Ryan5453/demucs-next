@@ -15,7 +15,12 @@ METADATA_PATH = Path(__file__).parent.parent / "metadata.json"
 
 
 def format_file_size(size_bytes: int) -> str:
-    """Format file size in a human-readable way"""
+    """
+    Format file size in a human-readable way.
+
+    :param size_bytes: Size in bytes
+    :return: Human-readable size string (e.g. "1.5 MB")
+    """
     if size_bytes < 1024:
         return f"{size_bytes} B"
     elif size_bytes < 1024 * 1024:
@@ -29,7 +34,16 @@ def format_file_size(size_bytes: int) -> str:
 def format_output_path(
     template: str, model: str, track: Path, stem: str, ext: str = "wav"
 ) -> Path:
-    """Format output path template with variables"""
+    """
+    Format output path template with variables.
+
+    :param template: Path template with {variable} placeholders
+    :param model: Model name
+    :param track: Path to the source track
+    :param stem: Stem name
+    :param ext: Output file extension
+    :return: Resolved output path
+    """
     now = datetime.now()
     # Template variables
     variables = {
@@ -51,7 +65,12 @@ def format_output_path(
 
 
 def get_models() -> dict[str, dict]:
-    """Get models from metadata.json"""
+    """
+    Get models from metadata.json.
+
+    :return: Dictionary mapping model names to their metadata
+    :raises RuntimeError: If the metadata structure is invalid
+    """
     with open(METADATA_PATH, "r") as f:
         metadata = json.load(f)
 
@@ -67,8 +86,8 @@ def get_models() -> dict[str, dict]:
 def _get_common_audio_extensions() -> set[str]:
     """
     Get a set of common audio file extensions.
-    This is used as a fast heuristic filter - the actual file validation
-    is done by torchcodec's AudioDecoder when loading.
+
+    :return: Set of file extension strings including the leading dot
     """
     # Common audio/video formats that typically contain audio streams
     # Note: This is just a heuristic for performance - torchcodec determines actual support
@@ -93,7 +112,9 @@ def _get_common_audio_extensions() -> set[str]:
 def _looks_like_audio_file(path: Path) -> bool:
     """
     Fast heuristic check if a file might be audio based on extension.
-    This is just for performance - actual validation happens when torchcodec loads the file.
+
+    :param path: Path to check
+    :return: True if the file extension matches a known audio format
     """
     return path.suffix.lower() in _get_common_audio_extensions()
 
@@ -101,7 +122,9 @@ def _looks_like_audio_file(path: Path) -> bool:
 def expand_paths_to_audio_files(paths: list[Path]) -> list[Path]:
     """
     Expand directory paths to include all audio files, keep regular files as-is.
-    Uses common extensions as a fast filter - torchcodec validates actual support at load time.
+
+    :param paths: List of file or directory paths
+    :return: List of resolved audio file paths
     """
     audio_files = []
 

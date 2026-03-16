@@ -8,10 +8,11 @@ The `Separator` class is a high level representation of a Demucs audio source se
 
 ```python
 separator = Separator(
-    model: str | Model | ModelEnsemble = "htdemucs", 
+    model: str | Model | ModelEnsemble = "htdemucs",
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     only_load: str | None = None,
-    load_all: bool = False,
+    dtype: torch.dtype | None = None,
+    compile: bool = False,
 )
 ```
 
@@ -20,7 +21,8 @@ A `Separator` takes the following parameters:
 - `model` - The model to use for separation. While just passing in a string is the easiest, you can use `ModelRepository` to load models manually and then pass them in.
 - `device` - The device/backend to use for loading and running the model. Demucs can usually auto-detect the best backend to use based on the availability of the hardware using the heuristic above.
 - `only_load` - Optional, if specified, load only the specialized model for this stem (only applicable to bag-of-models like htdemucs_ft).
-- `load_all` - Optional, if `True`, load all layers of a model ensemble into VRAM immediately. If `False` (default), layers are swapped between CPU and VRAM as needed.
+- `dtype` - Optional, set to `torch.float16` for half-precision inference on CUDA. If `None`, uses default float32.
+- `compile` - Optional, if `True`, applies `torch.compile` for faster inference after an initial warmup. Best for API servers or batch processing; adds significant latency (~30s) to the first forward pass. Default is `False`.
 
 ### Attributes
 

@@ -35,4 +35,4 @@ export const HOP_LENGTH = NFFT / 4;
 export const SEGMENT_SECONDS = 10;
 export const SEGMENT_SAMPLES = SEGMENT_SECONDS * SAMPLE_RATE;
 
-export type ModelType = 'htdemucs' | 'htdemucs_6s' | 'hdemucs_mmi';
+export type ModelType = 'htdemucs' | 'htdemucs_6s';

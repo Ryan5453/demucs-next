@@ -11,74 +11,8 @@ import torch
 import torch.nn as nn
 
 from .blocks import spectro
-from .hdemucs import HDemucs
 from .htdemucs import HTDemucs
 from .repo import ModelRepository
-
-
-class HDemucsONNXWrapper(nn.Module):
-    """
-    Wrapper that makes HDemucs compatible with ONNX export.
-    """
-
-    def __init__(self, model: HDemucs):
-        super().__init__()
-        self.model = model
-        self.sources = model.sources
-        self.samplerate = model.samplerate
-        self.audio_channels = model.audio_channels
-        self.nfft = model.nfft
-        self.hop_length = model.hop_length
-
-    def forward(
-        self, spec_real: torch.Tensor, spec_imag: torch.Tensor, mix: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Forward pass for ONNX export.
-
-        Args:
-            spec_real: Real part of spectrogram [B, C, Fq, T]
-            spec_imag: Imaginary part of spectrogram [B, C, Fq, T]
-            mix: Raw audio waveform [B, C, samples]
-
-        Returns:
-            Tuple of (out_spec_real, out_spec_imag, out_wave):
-            - out_spec_real: Real part of separated spectrograms [B, S, C, Fq, T]
-            - out_spec_imag: Imaginary part of separated spectrograms [B, S, C, Fq, T]
-            - out_wave: Separated waveforms from time branch [B, S, C, samples]
-        """
-        B, C, Fq, T = spec_real.shape
-        samples = mix.shape[-1]
-
-        # Convert real/imag to CaC format: [ch0_real, ch0_imag, ch1_real, ch1_imag, ...]
-        x = torch.stack([spec_real, spec_imag], dim=2).reshape(B, C * 2, Fq, T)
-
-        # Normalize inputs
-        mean = x.mean(dim=(1, 2, 3), keepdim=True)
-        std = x.std(dim=(1, 2, 3), keepdim=True)
-        x = (x - mean) / (1e-5 + std)
-
-        meant = mix.mean(dim=(1, 2), keepdim=True)
-        stdt = mix.std(dim=(1, 2), keepdim=True)
-        xt = (mix - meant) / (1e-5 + stdt)
-
-        # Core encoder-decoder processing (no transformer in HDemucs)
-        x, xt = self.model.forward_core(x, xt)
-
-        # Denormalize and reshape frequency branch output
-        S = len(self.sources)
-        x = x.view(B, S, -1, Fq, T)
-        x = x * std[:, None] + mean[:, None]
-
-        # Split CaC back into real/imag
-        out_spec_real = x[:, :, 0::2, :, :]
-        out_spec_imag = x[:, :, 1::2, :, :]
-
-        # Denormalize and reshape time branch output
-        xt = xt.view(B, S, -1, samples)
-        xt = xt * stdt[:, None] + meant[:, None]
-
-        return out_spec_real, out_spec_imag, xt
 
 
 class HTDemucsONNXWrapper(nn.Module):
@@ -86,7 +20,12 @@ class HTDemucsONNXWrapper(nn.Module):
     Wrapper that makes HTDemucs compatible with ONNX export.
     """
 
-    def __init__(self, model: HTDemucs):
+    def __init__(self, model: HTDemucs) -> None:
+        """
+        Initialize the ONNX wrapper.
+
+        :param model: The HTDemucs model to wrap for ONNX export
+        """
         super().__init__()
         self.model = model
         self.sources = model.sources
@@ -101,16 +40,10 @@ class HTDemucsONNXWrapper(nn.Module):
         """
         Forward pass for ONNX export.
 
-        Args:
-            spec_real: Real part of spectrogram [B, C, Fq, T]
-            spec_imag: Imaginary part of spectrogram [B, C, Fq, T]
-            mix: Raw audio waveform [B, C, samples]
-
-        Returns:
-            Tuple of (out_spec_real, out_spec_imag, out_wave):
-            - out_spec_real: Real part of separated spectrograms [B, S, C, Fq, T]
-            - out_spec_imag: Imaginary part of separated spectrograms [B, S, C, Fq, T]
-            - out_wave: Separated waveforms from time branch [B, S, C, samples]
+        :param spec_real: Real part of spectrogram [B, C, Fq, T]
+        :param spec_imag: Imaginary part of spectrogram [B, C, Fq, T]
+        :param mix: Raw audio waveform [B, C, samples]
+        :return: Tuple of (out_spec_real, out_spec_imag, out_wave) separated spectrograms and waveforms
         """
         B, C, Fq, T = spec_real.shape
         samples = mix.shape[-1]
@@ -152,13 +85,10 @@ def compute_stft_for_export(
     """
     Compute STFT for model input, matching HTDemucs preprocessing.
 
-    Args:
-        audio: Input audio [B, C, samples]
-        nfft: FFT size
-        hop_length: Hop length
-
-    Returns:
-        Tuple of (real, imag) spectrograms [B, C, Fq, T]
+    :param audio: Input audio [B, C, samples]
+    :param nfft: FFT size
+    :param hop_length: Hop length
+    :return: Tuple of (real, imag) spectrograms [B, C, Fq, T]
     """
     # Padding to match HTDemucs._spec
     le = int(math.ceil(audio.shape[-1] / hop_length))
@@ -188,20 +118,20 @@ def export_to_onnx(
     output_path: str | None = None,
     opset_version: int = 17,
     segment_seconds: float = 10.0,
+    fp16: bool = False,
 ) -> str:
     """
     Export Demucs model to ONNX format.
 
-    Supports both HDemucs (v3) and HTDemucs (v4) models.
-
-    Args:
-        model_name: Name of the model to export
-        output_path: Path to save the ONNX model (defaults to {model_name}.onnx)
-        opset_version: ONNX opset version
-        segment_seconds: Audio segment length in seconds
-
-    Returns:
-        Path to the exported ONNX model
+    :param model_name: Name of the model to export
+    :param output_path: Path to save the ONNX model (defaults to {model_name}.onnx)
+    :param opset_version: ONNX opset version
+    :param segment_seconds: Audio segment length in seconds
+    :param fp16: If True, convert model weights to float16 for smaller size and faster
+        WebGPU inference. Inputs/outputs remain float32.
+    :return: Path to the exported ONNX model
+    :raises ImportError: If the onnx package is not installed
+    :raises ValueError: If the model is not an HTDemucs instance
     """
     try:
         import onnx
@@ -212,21 +142,18 @@ def export_to_onnx(
         )
 
     if output_path is None:
-        output_path = f"{model_name}.onnx"
+        suffix = "_fp16" if fp16 else ""
+        output_path = f"{model_name}{suffix}.onnx"
 
     repo = ModelRepository()
     model = repo.get_model(model_name)
 
-    # Auto-detect model type and select appropriate wrapper
-    if isinstance(model, HTDemucs):
-        wrapper = HTDemucsONNXWrapper(model)
-    elif isinstance(model, HDemucs):
-        wrapper = HDemucsONNXWrapper(model)
-    else:
+    if not isinstance(model, HTDemucs):
         raise ValueError(
             f"Model {model_name} is not a supported model type. "
-            f"Expected HDemucs or HTDemucs, got {type(model).__name__}"
+            f"Expected HTDemucs, got {type(model).__name__}"
         )
+    wrapper = HTDemucsONNXWrapper(model)
 
     model.eval()
     wrapper.eval()
@@ -260,12 +187,11 @@ def export_to_onnx(
         },
         opset_version=opset_version,
         do_constant_folding=True,
+        dynamo=False,
     )
 
     onnx_model = onnx.load(output_path)
 
-    # This did not end up getting used in the web app
-    # But I thought it still might be useful for someone else
     sources_meta = onnx_model.metadata_props.add()
     sources_meta.key = "sources"
     sources_meta.value = json.dumps(model.sources)
@@ -277,6 +203,24 @@ def export_to_onnx(
     channels_meta = onnx_model.metadata_props.add()
     channels_meta.key = "audio_channels"
     channels_meta.value = str(model.audio_channels)
+
+    if fp16:
+        from onnxruntime.transformers.float16 import convert_float_to_float16
+
+        onnx_model = convert_float_to_float16(
+            onnx_model,
+            keep_io_types=True,
+            op_block_list=[
+                "LayerNormalization",
+                "InstanceNormalization",
+                "ReduceMean",
+                "Softmax",
+                "Pow",
+                "Sqrt",
+                "Range",
+                "Mod",
+            ],
+        )
 
     onnx.save(onnx_model, output_path)
 

@@ -121,9 +121,9 @@ def separate_command(
             rich_help_panel="Output",
         ),
     ] = "wav",
-):
+) -> None:
     """
-    Separate the sources for the given tracks
+    Separate the sources for the given tracks.
     """
     if tracks is None or not tracks:
         ctx = click.get_current_context()

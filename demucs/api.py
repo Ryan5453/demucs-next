@@ -134,7 +134,8 @@ class Separator:
         if torch.backends.mps.is_available()
         else "cpu",
         only_load: str | None = None,
-        load_all: bool = False,
+        dtype: torch.dtype | None = None,
+        compile: bool = False,
     ):
         """
         Initialize a Separator with the specified model and device.
@@ -143,8 +144,11 @@ class Separator:
         :param device: Device to use for processing (must be "cpu", "cuda", or "mps")
         :param only_load: If specified, load only the specialized model for this stem
                          (only applicable to bag-of-models like htdemucs_ft)
-        :param load_all: If True, load all layers of a model ensemble into VRAM immediately.
-                         If False (default), layers are swapped between CPU and VRAM as needed.
+        :param dtype: Set to torch.float16 for half-precision inference on CUDA.
+                     If None, uses default float32. Model weights are cast at init time.
+        :param compile: If True, apply ``torch.compile`` for faster inference after an
+                       initial warmup. Best for API servers or batch processing; adds
+                       significant latency to the first forward pass.
         :raises ValidationError: If device is not valid or only_load stem doesn't exist
         :raises ModelLoadingError: If model fails to load
         """
@@ -155,7 +159,20 @@ class Separator:
                 f"Invalid device '{device}'. Must be one of: {', '.join(sorted(valid_devices))}"
             )
 
+        # Validate dtype — only FP16 on CUDA is supported
+        if dtype is not None:
+            if dtype != torch.float16:
+                raise ValidationError(
+                    f"Invalid dtype '{dtype}'. Only torch.float16 is supported."
+                )
+            if device != "cuda":
+                raise ValidationError(
+                    "float16 inference is only supported on CUDA. "
+                    "CPU and MPS do not benefit from reduced precision."
+                )
+
         self.device = device
+        self.dtype = dtype
 
         # Handle both string model names and model instances
         if isinstance(model, str):
@@ -179,15 +196,43 @@ class Separator:
         self.audio_channels = self.model.audio_channels
         self.sample_rate = self.model.samplerate
 
+        if self.device == "cuda":
+            torch.backends.cudnn.benchmark = True
+            torch.set_float32_matmul_precision("high")
+
         if self.device in {"cuda", "mps"}:
+            self.model.to(self.device)
+
+        # Cast weights to FP16 if requested.
+        if self.dtype is not None:
             if isinstance(self.model, ModelEnsemble):
-                # By default, only load the first model of a ModelEnsemble
-                if load_all:
-                    self.model.to(self.device)
-                else:
-                    self.model.models[0].to(self.device)
+                for m in self.model.models:
+                    m.to(dtype=self.dtype)
             else:
-                self.model.to(self.device)
+                self.model.to(dtype=self.dtype)
+
+        # torch.compile: JIT-compile for fused kernels and reduced launch overhead.
+        # reduce-overhead mode enables CUDA graphs for minimal kernel launch cost.
+        # Disabled by default because compilation adds ~30s to init time.
+        if compile and self.device == "cuda":
+            if isinstance(self.model, ModelEnsemble):
+                for i, m in enumerate(self.model.models):
+                    self.model.models[i] = torch.compile(
+                        m, mode="reduce-overhead"
+                    )
+            else:
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+
+            # Warmup pass with synthetic audio to trigger compilation now
+            # rather than on the first real call.
+            warmup = torch.zeros(
+                1, self.audio_channels, self.sample_rate, device=self.device
+            )
+            if self.dtype is not None:
+                warmup = warmup.to(dtype=self.dtype)
+            with torch.no_grad():
+                self.model(warmup)
+            del warmup
 
     def _to_tensor(self, audio: tuple[Tensor, int] | Path | str | bytes) -> Tensor:
         """
@@ -259,6 +304,7 @@ class Separator:
         split_overlap: float = 0.25,
         progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
         use_only_stem: str | None = None,
+        chunk_batch_size: int | None = None,
     ) -> SeparatedSources:
         """
         Separate audio into stems. Accepts tensor with sample rate, file path, or raw bytes.
@@ -276,6 +322,9 @@ class Separator:
         :param progress_callback: Optional callback for progress updates during audio processing
         :param use_only_stem: If specified and model is a ModelEnsemble, only use the model
                              specialized for this stem (performance optimization for Cog)
+        :param chunk_batch_size: Number of audio chunks to process simultaneously when splitting.
+                               Higher values use more VRAM but improve throughput by saturating GPU compute.
+                               Defaults to 4 on CUDA (up to 1.9x faster), 1 on CPU/MPS.
         :return: SeparatedSources object containing the separated stems
         :raises ValidationError: If any parameter value is invalid
         """
@@ -311,6 +360,16 @@ class Separator:
                 f"progress_callback must be callable if provided, got {type(progress_callback)}"
             )
 
+        # Auto-select chunk_batch_size based on device if not specified
+        if chunk_batch_size is None:
+            chunk_batch_size = 4 if self.device == "cuda" else 1
+
+        # Validate chunk_batch_size parameter
+        if not isinstance(chunk_batch_size, int) or chunk_batch_size < 1:
+            raise ValidationError(
+                f"chunk_batch_size must be a positive integer, got {chunk_batch_size}"
+            )
+
         # Normalize input to tensor
         wav = self._to_tensor(audio)
 
@@ -330,6 +389,7 @@ class Separator:
             segment=split_size,
             progress_callback=progress_callback,
             use_only_stem=use_only_stem,
+            chunk_batch_size=chunk_batch_size,
         )[0]
 
         sources = {}
@@ -340,11 +400,6 @@ class Separator:
 
 
 def select_model(
-    audio: tuple[Tensor, int]
-    | Path
-    | str
-    | list[tuple[Tensor, int] | Path | str]
-    | None = None,
     isolate_stem: str | None = None,
 ) -> tuple[str, str | None]:
     """
@@ -358,15 +413,8 @@ def select_model(
       - guitar, piano -> htdemucs_6s (6-stem model)
       - drums -> htdemucs (already optimal)
 
-    - For full separation on long audio (>=7 min): Uses hdemucs_mmi
-      (higher quality and significantly faster for long files)
-
     - Default: htdemucs (balanced quality/performance)
 
-    :param audio: Audio for duration analysis - can be:
-                 - A tuple of (Tensor, sample_rate) where Tensor is shape [channels, samples]
-                 - A file path (str or Path)
-                 - A list of any of the above
     :param isolate_stem: Specific stem to isolate.
     :return: Tuple of (model_name, only_load_stem)
         - model_name: Name of the recommended model
@@ -385,39 +433,6 @@ def select_model(
         if isolate_stem in ["bass", "other", "vocals"]:
             # htdemucs_ft has fine-tuned models for these stems
             return ("htdemucs_ft", isolate_stem)
-
-    # Duration-based selection for full separation (quality + speed optimization)
-    if audio:
-        durations = []
-        files = audio if isinstance(audio, list) else [audio]
-
-        for file in files:
-            if isinstance(file, tuple):
-                # For Tensor inputs as (tensor, sample_rate)
-                try:
-                    wav, sr = file
-                    # Tensor shape is [channels, samples]
-                    num_samples = wav.shape[-1] if wav.dim() > 0 else 0
-                    duration = num_samples / sr
-                    durations.append(duration)
-                except Exception:
-                    # Skip if we can't determine duration
-                    pass
-            elif isinstance(file, (str, Path)):
-                try:
-                    decoder = AudioDecoder(str(file))
-                    duration = decoder.metadata.duration_seconds_from_header
-                    if duration is not None:
-                        durations.append(duration)
-                except Exception:
-                    # Skip files that fail to load - don't break the flow
-                    pass
-
-        if durations:
-            avg_duration = sum(durations) / len(durations)
-            if avg_duration >= 420:  # 7 minutes
-                # hdemucs_mmi provides better quality and is faster for long files
-                return ("hdemucs_mmi", None)
 
     # Default: htdemucs is the best balanced model
     return ("htdemucs", None)
