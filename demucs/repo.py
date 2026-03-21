@@ -23,9 +23,9 @@ from .states import load_model
 BASE_CDN_URL = "https://dl.fbaipublicfiles.com/demucs"
 
 
-def check_checksum(path: Path, checksum: str):
+def check_checksum(path: Path, checksum: str) -> None:
     """
-    Verifies that a file matches an expected checksum.
+    Verify that a file matches an expected checksum.
 
     :param path: Path to the file to check
     :param checksum: Expected SHA-256 checksum (first 8 characters)
@@ -61,9 +61,11 @@ def get_cache_dir() -> Path:
 class ModelRepository:
     """Repository system for accessing models."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         """
-        Initialize the repository.
+        Initialize the model repository from metadata.json.
+
+        :raises ModelLoadingError: If the metadata structure is invalid
         """
         # Determine metadata_path relative to this file
         current_file_path = Path(__file__)
@@ -94,8 +96,7 @@ class ModelRepository:
         """
         Get information about cached models.
 
-        Returns:
-            Dictionary with information about cached models
+        :return: Dictionary mapping model names to their cache info
         """
         cache_dir = get_cache_dir()
         cached_models = {}
@@ -147,7 +148,19 @@ class ModelRepository:
         layer_index: int = 1,
         total_layers: int = 1,
     ) -> Model | ModelEnsemble:
-        """Download and load a model layer from a URL."""
+        """
+        Download and load a model layer from a URL.
+
+        :param url: URL to download the layer from
+        :param cache_path: Local path to cache the downloaded layer
+        :param expected_checksum: Expected SHA-256 checksum for verification
+        :param progress_callback: Optional callback for download progress updates
+        :param model_name: Name of the model being downloaded
+        :param layer_index: Index of the current layer (1-based)
+        :param total_layers: Total number of layers to download
+        :return: The loaded model
+        :raises ModelLoadingError: If download or loading fails
+        """
         # Download the file to memory first
         try:
             with httpx.stream("GET", url, follow_redirects=True) as response:
@@ -283,22 +296,13 @@ class ModelRepository:
         progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> Model | ModelEnsemble:
         """
-        Get a model by name.
+        Get a model by name, downloading if necessary.
 
-        Args:
-            name: Model name
-            only_load: If specified and model is a bag with stem-specialized models,
-                      load only the model for this stem. Ignored for single models.
-            progress_callback: Optional callback function for progress updates.
-                              Called with progress_callback(event_type: str, data: dict[str, str | int | float]):
-                              - "download_start", {"model_name": str, "total_layers": int}
-                              - "layer_start", {"model_name": str, "layer_index": int, "total_layers": int, "layer_size_bytes": int}
-                              - "layer_progress", {"model_name": str, "layer_index": int, "total_layers": int, "progress_percent": float, "downloaded_bytes": int, "total_bytes": int, "phase": str}
-                              - "layer_complete", {"model_name": str, "layer_index": int, "total_layers": int}
-                              - "download_complete", {"model_name": str, "total_layers": int}
-
-        Returns:
-            The requested model
+        :param name: Model name
+        :param only_load: If specified, load only the model specialized for this stem
+        :param progress_callback: Optional callback for download progress updates
+        :return: The requested model
+        :raises ModelLoadingError: If the model is not found or fails to load
         """
         # Only load models, not individual layers
         if name not in self._models:
@@ -484,7 +488,7 @@ class ModelRepository:
 
                 # Apply segment override if needed
                 if segment is not None:
-                    # Import here to avoid circular imports
+                    # Embedded import to avoid circular dependency: repo -> htdemucs -> repo
                     from .htdemucs import HTDemucs
 
                     if (
@@ -502,8 +506,7 @@ class ModelRepository:
         """
         List all available models.
 
-        Returns:
-            Dictionary mapping model names to their metadata
+        :return: Dictionary mapping model names to their metadata
         """
         result = {}
 
@@ -517,11 +520,8 @@ class ModelRepository:
         """
         Remove a model from the cache.
 
-        Args:
-            name: Model name
-
-        Returns:
-            True if the model was successfully removed, False otherwise
+        :param name: Model name
+        :return: True if the model was removed, False if not found
         """
         if name not in self._models:
             return False

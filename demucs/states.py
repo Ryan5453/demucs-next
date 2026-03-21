@@ -8,6 +8,7 @@
 import functools
 import inspect
 import warnings
+from collections.abc import Callable
 from pathlib import Path
 
 import torch
@@ -33,9 +34,15 @@ _DEPRECATED_PARAMS = frozenset(
 )
 
 
-def load_model(path_or_package, strict=False):
-    """Load a model from the given serialized model, either given as a dict (already loaded)
-    or a path to a file on disk."""
+def load_model(path_or_package: dict | str | Path, strict: bool = False) -> torch.nn.Module:
+    """
+    Load a model from a serialized dict or a file path.
+
+    :param path_or_package: A dict (already loaded) or path to a serialized model file
+    :param strict: If True, do not drop unknown parameters
+    :return: The loaded model with state restored
+    :raises ValueError: If path_or_package is not a dict, str, or Path
+    """
     if isinstance(path_or_package, dict):
         package = path_or_package
     elif isinstance(path_or_package, (str, Path)):
@@ -67,13 +74,24 @@ def load_model(path_or_package, strict=False):
     return model
 
 
-def set_state(model, state):
-    """Set the state on a given model."""
+def set_state(model: torch.nn.Module, state: dict) -> None:
+    """
+    Set the state dict on a model.
+
+    :param model: The model to load state into
+    :param state: The state dict to load
+    """
     model.load_state_dict(state)
-    return state
 
 
-def capture_init(init):
+def capture_init(init: Callable) -> Callable:
+    """
+    Decorator that captures the args and kwargs passed to __init__.
+
+    :param init: The __init__ method to wrap
+    :return: Wrapped __init__ that stores args/kwargs on the instance
+    """
+
     @functools.wraps(init)
     def __init__(self, *args, **kwargs):
         self._init_args_kwargs = (args, kwargs)

@@ -11,8 +11,15 @@ from torch import Tensor
 from .exceptions import ValidationError
 
 
-def convert_audio_channels(wav, channels=2):
-    """Convert audio to the given number of channels."""
+def convert_audio_channels(wav: Tensor, channels: int = 2) -> Tensor:
+    """
+    Convert audio to the given number of channels.
+
+    :param wav: Audio tensor to convert
+    :param channels: Target number of channels
+    :return: Audio tensor with the target number of channels
+    :raises ValueError: If the audio has fewer channels than requested but is not mono
+    """
     *shape, src_channels, length = wav.shape
     if src_channels == channels:
         pass
@@ -39,8 +46,16 @@ def convert_audio_channels(wav, channels=2):
     return wav
 
 
-def convert_audio(wav, from_samplerate, to_samplerate, channels) -> Tensor:
-    """Convert audio from a given samplerate to a target one and target number of channels."""
+def convert_audio(wav: Tensor, from_samplerate: int, to_samplerate: int, channels: int) -> Tensor:
+    """
+    Convert audio to a target sample rate and number of channels.
+
+    :param wav: Audio tensor to convert
+    :param from_samplerate: Source sample rate
+    :param to_samplerate: Target sample rate
+    :param channels: Target number of channels
+    :return: Converted audio tensor
+    """
     wav = convert_audio_channels(wav, channels)
     return torchaudio.functional.resample(wav, from_samplerate, to_samplerate)
 

@@ -36,7 +36,7 @@ def separate_command(
             help="Model to use for separation",
             rich_help_panel="Model Selection",
         ),
-    ] = ModelName.htdemucs,
+    ] = ModelName.auto,
     # Processing Options
     device: Annotated[
         DeviceType,
@@ -83,11 +83,19 @@ def separate_command(
         typer.Option(
             "--split-overlap",
             min=0.0,
-            max=1.0,
+            max=0.999999,
             help="Overlap between split chunks, higher values improve quality at chunk boundaries",
             rich_help_panel="Processing",
         ),
     ] = 0.25,
+    compile: Annotated[
+        bool,
+        typer.Option(
+            "--compile/--no-compile",
+            help="Compile the HTDemucs neural network core on CUDA. Improves steady-state throughput for long-running jobs, but adds a heavy warmup cost.",
+            rich_help_panel="Processing",
+        ),
+    ] = False,
     # Output
     output: Annotated[
         str,
@@ -121,9 +129,9 @@ def separate_command(
             rich_help_panel="Output",
         ),
     ] = "wav",
-):
+) -> None:
     """
-    Separate the sources for the given tracks
+    Separates the given tracks.
     """
     if tracks is None or not tracks:
         ctx = click.get_current_context()
@@ -137,9 +145,8 @@ def separate_command(
         console.print("[red]No audio files found to process.[/red]")
         return
 
-    if model.value == "auto":
+    if model.value == ModelName.auto.value:
         selected_model_name, only_load_stem = select_model(
-            audio=audio_files,
             isolate_stem=isolate_stem.value if isolate_stem else None,
         )
         console.print(
@@ -156,6 +163,8 @@ def separate_command(
         model=selected_model_name,
         device=device.value,
         only_load=only_load_stem,
+        dtype=torch.float16 if device.value == DeviceType.cuda.value else None,
+        compile=compile,
     )
 
     if isolate_stem is not None and isolate_stem.value not in separator.model.sources:

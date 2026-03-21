@@ -26,13 +26,10 @@ export interface STFTResult {
     numFrames: number;
 }
 
-export const SOURCES = ['drums', 'bass', 'other', 'vocals'] as const;
-export type SourceName = typeof SOURCES[number];
-
 export const SAMPLE_RATE = 44100;
 export const NFFT = 4096;
 export const HOP_LENGTH = NFFT / 4;
 export const SEGMENT_SECONDS = 10;
 export const SEGMENT_SAMPLES = SEGMENT_SECONDS * SAMPLE_RATE;
 
-export type ModelType = 'htdemucs' | 'htdemucs_6s' | 'hdemucs_mmi';
+export type ModelType = 'htdemucs' | 'htdemucs_6s';

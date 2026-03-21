@@ -1,14 +1,5 @@
 {
   "models": {
-    "hdemucs_mmi": {
-      "models": [
-        {
-          "remote": "hybrid_transformer/75fc33f5-1941ce65.th",
-          "checksum": "1941ce65"
-        }
-      ],
-      "segment": 44
-    },
     "htdemucs": {
       "models": [
         {

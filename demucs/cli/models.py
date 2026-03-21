@@ -23,7 +23,7 @@ from .progress import create_model_progress_bar, create_progress_callback
 from .utils import console, format_file_size, get_models
 
 
-def list_models_command():
+def list_models_command() -> None:
     """
     List all available models and show which ones are downloaded.
     """
@@ -74,9 +74,12 @@ def download_models_command(
             "--all", help="Download all available models (may take some time)"
         ),
     ] = False,
-):
+) -> None:
     """
     Download and cache the specified models for offline use.
+
+    :param names: Model names to download
+    :param all_models: If True, download all available models
     """
     if not all_models and (names is None or not names):
         console.print("[red]Error:[/red] No models specified for download.")
@@ -104,9 +107,12 @@ def remove_models_command(
         bool,
         typer.Option("--all", help="Remove all downloaded models"),
     ] = False,
-):
+) -> None:
     """
     Remove models from the cache to free up space.
+
+    :param names: Model names to remove
+    :param all_models: If True, remove all downloaded models
     """
     model_repo = ModelRepository()
 
@@ -158,7 +164,9 @@ def remove_models_command(
 def _download_model_with_progress(name: str) -> bool:
     """
     Download a single model with progress display.
-    Returns True if successful, False otherwise.
+
+    :param name: Model name to download
+    :return: True if successful, False otherwise
     """
 
     models = get_models()
@@ -231,7 +239,9 @@ def _download_model_with_progress(name: str) -> bool:
 def ensure_model_available(name: str) -> bool:
     """
     Ensure a model is available, downloading if necessary.
-    Returns True if model is available, False otherwise.
+
+    :param name: Model name to check/download
+    :return: True if model is available, False otherwise
     """
     model_repo = ModelRepository()
     cache_info = model_repo.get_cache_info()
@@ -245,7 +255,8 @@ def ensure_model_available(name: str) -> bool:
 def _download_models_batch(model_names: list[str]) -> None:
     """
     Download multiple models, showing progress for each.
-    This is the unified download logic used by both download and separate commands.
+
+    :param model_names: List of model names to download
     """
     model_repo = ModelRepository()
     cache_info = model_repo.get_cache_info()
@@ -287,8 +298,14 @@ def _download_models_batch(model_names: list[str]) -> None:
     console.print("[bold green]Download complete![/bold green]")
 
 
-def _download_single_model_in_batch(name: str, models: dict, progress_bar) -> None:
-    """Download a single model within an existing progress bar context."""
+def _download_single_model_in_batch(name: str, models: dict, progress_bar: Progress) -> None:
+    """
+    Download a single model within an existing progress bar context.
+
+    :param name: Model name to download
+    :param models: Dictionary of available model metadata
+    :param progress_bar: Rich progress bar to update
+    """
 
     try:
         start_time = time.time()
