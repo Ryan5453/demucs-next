@@ -80,6 +80,8 @@ export function processISTFT(request: ISTFTRequest): Promise<ISTFTResult> {
         initISTFTWorker();
     }
 
+    failPending('Superseded by a new ISTFT request');
+
     return new Promise((resolve, reject) => {
         pendingResolve = resolve;
         pendingReject = reject;

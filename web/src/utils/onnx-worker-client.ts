@@ -208,6 +208,8 @@ export function isWorkerActive(): boolean {
  * Send a message to the worker and wait for response
  */
 function sendMessage(message: LoadModelMessage | RunInferenceMessage | UnloadMessage): Promise<WorkerResponse> {
+    failPending('Superseded by a new ONNX request');
+
     return new Promise((resolve, reject) => {
         pendingResolve = resolve;
         pendingReject = reject;

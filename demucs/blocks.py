@@ -245,7 +245,6 @@ class DConv(nn.Module):
         self.channels = channels
         self.compress = compress
         self.depth = abs(depth)
-        self._has_sensitive_ops = lstm or attn
         dilate = depth > 0
 
         norm_fn: Callable[[int], nn.Module]

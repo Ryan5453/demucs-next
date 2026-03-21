@@ -57,6 +57,8 @@ export function processSTFT(segmentInterleaved: Float32Array): Promise<STFTResul
         initSTFTWorker();
     }
 
+    failPending('Superseded by a new STFT request');
+
     return new Promise((resolve, reject) => {
         pendingResolve = resolve;
         pendingReject = reject;

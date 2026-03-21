@@ -4,7 +4,7 @@
 > `demucs-next` is still in development not recommended for production use.
 
 Demucs is a SOTA music source separation model capable of separating drums, bass, and vocals from the rest of the accompaniment.
-This is a fork of the [author's fork](https://github.com/adefossez/demucs) of the original Demucs repository. 
+This is a fork of the [author's fork](https://github.com/adefossez/demucs) of the original Demucs repository.
 
 `demucs-next` has been updated to use modern versions of Python, PyTorch, and TorchCodec. It is significantly faster and easier to use than upstream Demucs.
 
