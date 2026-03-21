@@ -15,7 +15,6 @@ export interface ModelInfo {
 export const MODELS: ModelInfo[] = [
     { id: 'htdemucs', name: 'Demucs v4', stems: 4, sizeMB: 161, supportsWebGPU: true, badge: 'recommended' },
     { id: 'htdemucs_6s', name: 'Demucs v4 (6-stem)', stems: 6, sizeMB: 105, supportsWebGPU: true, badge: 'experimental' },
-    { id: 'hdemucs_mmi', name: 'Demucs v3', stems: 4, sizeMB: 320, supportsWebGPU: false },
 ];
 
 interface SettingsProps {

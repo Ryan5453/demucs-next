@@ -8,10 +8,11 @@ The `Separator` class is a high level representation of a Demucs audio source se
 
 ```python
 separator = Separator(
-    model: str | Model | ModelEnsemble = "htdemucs", 
-    device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    model: str | Model | ModelEnsemble = "htdemucs",
+    device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu",
     only_load: str | None = None,
-    load_all: bool = False,
+    dtype: torch.dtype | None = None,
+    compile: bool = False,
 )
 ```
 
@@ -19,9 +20,15 @@ A `Separator` takes the following parameters:
 
 - `model` - The model to use for separation. While just passing in a string is the easiest, you can use `ModelRepository` to load models manually and then pass them in.
 - `device` - The device/backend to use for loading and running the model. Demucs can usually auto-detect the best backend to use based on the availability of the hardware using the heuristic above.
+<<<<<<< HEAD
 - `only_load` - Optional, if specified, load only the specialized model for this stem (only applicable to ensembles like htdemucs_ft).
 - `dtype` - Optional, set to `torch.float16` for half-precision inference on CUDA. If `None`, uses default float32.
 - `compile` - Optional, if `True`, compiles the core of the HTDemucs neural network on CUDA. This will significantly improve the performance of the model at the cost of a significant warmup cost. 
+=======
+- `only_load` - Optional, if specified, load only the specialized model for this stem (only applicable to bag-of-models like htdemucs_ft).
+- `dtype` - Optional, set to `torch.float16` for half-precision inference on CUDA. If `None`, uses default float32.
+- `compile` - Optional, if `True`, compiles only the `HTDemucs.forward_core()` neural network body on CUDA. This avoids the complex STFT/iSTFT path and improves steady-state throughput for long-lived jobs. Use `Separator.warmup(batch_sizes=[...])` to precompile the batch sizes you expect to serve. Default is `False`.
+>>>>>>> 6b37e0794b55ee4c1ee155d2f40eaeb2d598e5b7
 
 ### Attributes
 
@@ -32,7 +39,11 @@ After construction, the following attributes are available on a `Separator` inst
 - `audio_channels` - Number of audio channels the model expects (`int`).
 - `sample_rate` - Sample rate the model operates at (`int`).
 
+<<<<<<< HEAD
 If you enable compilation, you can optionally pre-warm the compiled path for the batch sizes you expect to run using the `warmup` method:
+=======
+If you enable compilation, you can optionally pre-warm the compiled path for the batch sizes you expect to run:
+>>>>>>> 6b37e0794b55ee4c1ee155d2f40eaeb2d598e5b7
 
 ```python
 separator.warmup(batch_sizes=[4, 1])
@@ -52,6 +63,7 @@ def separate(
     split_overlap: float = 0.25,
     progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
     use_only_stem: str | None = None,
+    chunk_batch_size: int | None = None,
 ) -> SeparatedSources:
 ```
 
@@ -61,9 +73,10 @@ When separating audio, you have the ability to specify the following parameters:
 - `shifts` - The number of random shifts for equivariant stabilization. In simple terms, this is a technique to make the model more robust to small changes in the audio, such as small shifts in time or pitch. More shifts mean generally higher quality separation but also longer processing time.
 - `split` - Whether to split the audio into chunks.
 - `split_size` - The size of each chunk in seconds.
-- `split_overlap` - The overlap between split chunks.
+- `split_overlap` - The overlap between split chunks. Must be in the range `[0.0, 1.0)`.
 - `progress_callback` - A callback function to receive progress updates. View the [Progress Callbacks](#progress-callbacks) section for more information.
 - `use_only_stem` - If specified, perform the separation using only the specialized model for this stem. In most cases you should use `only_load` when creating the `Separator` instance instead of this.
+- `chunk_batch_size` - Number of split chunks to process in parallel. Defaults to `4` on CUDA and `1` on CPU/MPS.
 
 ## SeparatedSources
 
@@ -106,16 +119,9 @@ As Demucs provides many models to perform audio source separation, it is often d
 
 ```python
 def select_model(
-    audio: tuple[Tensor, int] | Path | str | list[tuple[Tensor, int] | Path | str],
     isolate_stem: str | None = None,
 ) -> tuple[str, str | None]:
 ```
-
-Pass in either the following or a list of the above for the `audio` parameter:
-
-- A tuple of (Tensor, sample_rate)
-- A file path (str or Path)
-- A list of any of the above
 
 If you are attempting to isolate a single stem, pass in the name of the stem to the `isolate_stem` parameter.
 

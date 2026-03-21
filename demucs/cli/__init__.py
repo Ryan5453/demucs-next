@@ -12,16 +12,16 @@ from .onnx import export_onnx_command
 from .separate import separate_command
 
 
-def version_command():
+def version_command() -> None:
     """
-    Show the installed version of Demucs
+    Show the installed version of Demucs.
     """
     typer.echo(f"Demucs version: {__version__}")
 
 
-def main():
+def main() -> None:
     """
-    Load the checkpoints file and run the command.
+    Entry point for the Demucs CLI.
     """
     app = typer.Typer(
         add_completion=False,

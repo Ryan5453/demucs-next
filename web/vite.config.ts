@@ -25,6 +25,9 @@ export default defineConfig({
   optimizeDeps: {
     exclude: ['onnxruntime-web', '@ffmpeg/ffmpeg', '@ffmpeg/util'],
   },
+  worker: {
+    format: 'es',
+  },
   build: {
     target: 'esnext',
     rollupOptions: {
@@ -44,4 +47,3 @@ export default defineConfig({
     },
   },
 })
-

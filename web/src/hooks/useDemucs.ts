@@ -1,8 +1,9 @@
 import { useState, useCallback, useRef } from 'react';
 import type { DemucsState, LogEntry, ModelType } from '../types';
-import { SAMPLE_RATE, SEGMENT_SAMPLES, NFFT, HOP_LENGTH } from '../types';
+import { SAMPLE_RATE, SEGMENT_SAMPLES } from '../types';
 import { loadModel as loadOnnxModel, unloadModel as unloadOnnxModel, runInference, getSources } from '../utils/onnx-runtime';
-import { computeSTFT, computeISTFT, createSTFTBuffers, createISTFTBuffers } from '../utils/audio-processor';
+import { processISTFT, initISTFTWorker, terminateISTFTWorker, type ISTFTResult } from '../utils/istft-worker-client';
+import { processSTFT, initSTFTWorker, terminateSTFTWorker } from '../utils/stft-worker-client';
 import { createWavBlob } from '../utils/wav-utils';
 import { decodeAudioFile } from '../utils/audio-decoder';
 
@@ -48,6 +49,11 @@ export function useDemucs() {
         setState(prev => ({ ...prev, progress }));
     }, []);
 
+    const resetProcessingWorkers = useCallback(() => {
+        terminateSTFTWorker();
+        terminateISTFTWorker();
+    }, []);
+
     const getAudioContext = useCallback(() => {
         if (!audioContextRef.current) {
             audioContextRef.current = new AudioContext({ sampleRate: SAMPLE_RATE });
@@ -67,10 +73,11 @@ export function useDemucs() {
     }, [addLog]);
 
     const unloadModel = useCallback(async () => {
+        resetProcessingWorkers();
         await unloadOnnxModel();
         setState(prev => ({ ...prev, modelLoaded: false }));
         addLog('Model unloaded', 'info');
-    }, [addLog]);
+    }, [addLog, resetProcessingWorkers]);
 
     const clearAudioError = useCallback(() => {
         setAudioError(null);
@@ -133,6 +140,9 @@ export function useDemucs() {
         }
 
         try {
+            // Start each separation with fresh workers so a previous failed run
+            // cannot deliver stale responses into the new pipeline.
+            resetProcessingWorkers();
             setState(prev => ({ ...prev, separating: true }));
             setStemUrls({}); // Clear old URLs
             setStemWaveforms({}); // Clear old waveforms
@@ -182,122 +192,148 @@ export function useDemucs() {
 
             console.log('[Demucs] Created fade buffers');
 
-            // Pre-allocate reusable buffers to reduce GC pressure
-            const segmentPlanar = new Float32Array(SEGMENT_SAMPLES * numChannels);
-            const segmentInterleaved = new Float32Array(SEGMENT_SAMPLES * numChannels);
-            const specBufferSize = numChannels * (NFFT / 2) * Math.ceil(SEGMENT_SAMPLES / HOP_LENGTH);
-            const sourceReal = new Float32Array(specBufferSize);
-            const sourceImag = new Float32Array(specBufferSize);
-            console.log('[Demucs] Creating STFT buffers...');
-            const stftBuffers = createSTFTBuffers();
-            console.log('[Demucs] Creating ISTFT buffers...');
-            const istftBuffers = createISTFTBuffers();
-            console.log('[Demucs] Buffers created, starting segment loop...');
+            // Double-buffer planar audio so the next segment can be prepared
+            // without mutating the buffer currently being read by inference.
+            const planarBuffers = [
+                new Float32Array(SEGMENT_SAMPLES * numChannels),
+                new Float32Array(SEGMENT_SAMPLES * numChannels),
+            ];
+            console.log('[Demucs] Initializing workers...');
+            initSTFTWorker();
+            initISTFTWorker();
+            console.log('[Demucs] Workers ready, starting segment loop...');
+
+            let totalInferenceMs = 0;
+
+            // Pipeline: STFT and ISTFT run in Web Workers in parallel with GPU inference
+            // Main thread orchestrates: prepare segment → STFT worker → inference → ISTFT worker
+            let prevIstftPromise: Promise<ISTFTResult> | null = null;
+
+            function accumulateISTFTResult(result: ISTFTResult) {
+                const { chunks, segStart, segLength } = result;
+                for (let s = 0; s < sources.length; s++) {
+                    const chunk = chunks[s];
+                    for (let i = 0; i < segLength; i++) {
+                        const globalIdx = segStart + i;
+                        if (globalIdx >= numSamples) continue;
+                        const outIdx = globalIdx * numChannels;
+                        outputs[sources[s]][outIdx] += chunk[i * numChannels];
+                        outputs[sources[s]][outIdx + 1] += chunk[i * numChannels + 1];
+                    }
+                }
+            }
+
+            function prepareSegmentInterleaved(segStart: number, segLength: number): Float32Array {
+                const interleaved = new Float32Array(SEGMENT_SAMPLES * numChannels);
+                for (let i = 0; i < segLength; i++) {
+                    const srcIdx = (segStart + i) * numChannels;
+                    interleaved[i * 2] = audio[srcIdx];
+                    interleaved[i * 2 + 1] = audio[srcIdx + 1];
+                }
+                return interleaved;
+            }
+
+            function preparePlanar(
+                buffer: Float32Array,
+                segStart: number,
+                segLength: number
+            ): Float32Array {
+                buffer.fill(0);
+                for (let i = 0; i < segLength; i++) {
+                    const srcIdx = (segStart + i) * numChannels;
+                    buffer[i] = audio[srcIdx];
+                    buffer[SEGMENT_SAMPLES + i] = audio[srcIdx + 1];
+                }
+                return buffer;
+            }
+
+            // Kick off STFT for first segment
+            const seg0Start = 0;
+            const seg0End = Math.min(SEGMENT_SAMPLES, numSamples);
+            const seg0Length = seg0End - seg0Start;
+            let pendingStft = processSTFT(prepareSegmentInterleaved(seg0Start, seg0Length));
+            let pendingPlanarIndex = 0;
+            let pendingPlanar = preparePlanar(planarBuffers[pendingPlanarIndex], seg0Start, seg0Length);
 
             for (let seg = 0; seg < numSegments; seg++) {
                 const segStart = seg * STEP;
-
                 const segEnd = Math.min(segStart + SEGMENT_SAMPLES, numSamples);
                 const segLength = segEnd - segStart;
 
-                console.log(`[Demucs] Processing segment ${seg + 1}/${numSegments}`);
                 setStatus(`Separating segment ${seg + 1} of ${numSegments}...`);
                 setProgress(((seg + 1) / numSegments) * 95);
 
-                // Yield occasionally to allow React to render progress updates
                 if (seg % 5 === 0) {
                     await new Promise(resolve => requestAnimationFrame(resolve));
                 }
 
-
-                segmentPlanar.fill(0);
-                for (let i = 0; i < segLength; i++) {
-                    const srcIdx = (segStart + i) * numChannels;
-                    segmentPlanar[i] = audio[srcIdx];
-                    segmentPlanar[SEGMENT_SAMPLES + i] = audio[srcIdx + 1];
-                }
-
-                segmentInterleaved.fill(0);
-                for (let i = 0; i < SEGMENT_SAMPLES; i++) {
-                    segmentInterleaved[i * 2] = segmentPlanar[i];
-                    segmentInterleaved[i * 2 + 1] = segmentPlanar[SEGMENT_SAMPLES + i];
-                }
-
-                console.log('[Demucs] Computing STFT...');
-                const stft = computeSTFT(segmentInterleaved, stftBuffers);
-                console.log('[Demucs] STFT complete');
+                // Await STFT result for this segment (already computing in worker)
+                const stft = await pendingStft;
+                const currentPlanar = pendingPlanar;
 
                 const specShape = [1, numChannels, stft.numBins, stft.numFrames];
                 const audioShape = [1, numChannels, SEGMENT_SAMPLES];
 
-                console.log('[Demucs] Running model inference...');
-                const results = await runInference(
+                // Kick off inference (GPU)
+                const inferenceStart = performance.now();
+                const inferencePromise = runInference(
                     stft.real,
                     stft.imag,
-                    segmentPlanar,
+                    currentPlanar,
                     specShape,
                     audioShape
                 );
-                console.log('[Demucs] Inference complete');
 
-                // Results are always Float32Arrays (runInference handles tensor extraction)
-                const specRealData = results.outSpecReal;
-                const specImagData = results.outSpecImag;
-                const waveData = results.outWave;
-
-                for (let s = 0; s < sources.length; s++) {
-                    const specOffset = s * numChannels * stft.numBins * stft.numFrames;
-
-                    sourceReal.fill(0);
-                    sourceImag.fill(0);
-
-                    for (let c = 0; c < numChannels; c++) {
-                        const cOffset = c * stft.numBins * stft.numFrames;
-                        for (let b = 0; b < stft.numBins; b++) {
-                            for (let t = 0; t < stft.numFrames; t++) {
-                                const idx = b * stft.numFrames + t;
-                                const specIdx = specOffset + cOffset + idx;
-                                sourceReal[cOffset + idx] = specRealData[specIdx];
-                                sourceImag[cOffset + idx] = specImagData[specIdx];
-                            }
-                        }
-                    }
-
-                    // iSTFT computation
-                    const freqAudio = computeISTFT(sourceReal, sourceImag, numChannels, stft.numBins, stft.numFrames, SEGMENT_SAMPLES, istftBuffers);
-
-                    const sourceWaveOffset = s * numChannels * SEGMENT_SAMPLES;
-
-                    for (let i = 0; i < segLength; i++) {
-                        const globalIdx = segStart + i;
-                        if (globalIdx >= numSamples) continue;
-
-                        const outIdx = globalIdx * numChannels;
-
-                        const leftFreq = freqAudio[i];
-                        const rightFreq = freqAudio[SEGMENT_SAMPLES + i];
-                        const leftTime = waveData[sourceWaveOffset + i];
-                        const rightTime = waveData[sourceWaveOffset + SEGMENT_SAMPLES + i];
-
-                        const leftVal = leftFreq + leftTime;
-                        const rightVal = rightFreq + rightTime;
-
-                        let weight = 1.0;
-                        if (seg > 0 && i < OVERLAP) {
-                            weight = fadeIn[i];
-                        }
-                        if (seg < numSegments - 1 && i >= SEGMENT_SAMPLES - OVERLAP) {
-                            const fadeIdx = i - (SEGMENT_SAMPLES - OVERLAP);
-                            weight = fadeOut[fadeIdx];
-                        }
-
-                        outputs[sources[s]][outIdx] += leftVal * weight;
-                        outputs[sources[s]][outIdx + 1] += rightVal * weight;
-                    }
+                // While inference runs on GPU, kick off STFT for next segment in worker
+                if (seg + 1 < numSegments) {
+                    const nextSegStart = (seg + 1) * STEP;
+                    const nextSegEnd = Math.min(nextSegStart + SEGMENT_SAMPLES, numSamples);
+                    const nextSegLength = nextSegEnd - nextSegStart;
+                    pendingStft = processSTFT(prepareSegmentInterleaved(nextSegStart, nextSegLength));
+                    pendingPlanarIndex = 1 - pendingPlanarIndex;
+                    pendingPlanar = preparePlanar(
+                        planarBuffers[pendingPlanarIndex],
+                        nextSegStart,
+                        nextSegLength
+                    );
                 }
-                // Note: tensor disposal is now handled inside runInference()
+
+                // Await the GPU result
+                const results = await inferencePromise;
+                const inferenceEnd = performance.now();
+                totalInferenceMs += inferenceEnd - inferenceStart;
+
+                // Collect previous ISTFT result (should already be done by now)
+                if (prevIstftPromise) {
+                    const istftResult = await prevIstftPromise;
+                    accumulateISTFTResult(istftResult);
+                }
+
+                // Post current results to ISTFT worker (runs in parallel with next segment's inference)
+                prevIstftPromise = processISTFT({
+                    specReal: new Float32Array(results.outSpecReal),
+                    specImag: new Float32Array(results.outSpecImag),
+                    wave: new Float32Array(results.outWave),
+                    numSources: sources.length,
+                    numChannels,
+                    numBins: stft.numBins,
+                    numFrames: stft.numFrames,
+                    segStart, segLength, seg,
+                    numSegments, numSamples,
+                    fadeIn, fadeOut,
+                    overlap: OVERLAP,
+                });
             }
 
+            // Collect the final segment's ISTFT result
+            if (prevIstftPromise) {
+                const istftResult = await prevIstftPromise;
+                accumulateISTFTResult(istftResult);
+            }
+
+            console.log(`[Demucs] === Timing Summary ===`);
+            console.log(`[Demucs]   Inference: ${(totalInferenceMs / 1000).toFixed(2)}s`);
+            console.log(`[Demucs]   Wall time: ${((performance.now() - startTime) / 1000).toFixed(2)}s`);
 
             // Create blob URLs IMMEDIATELY after separation (like original code)
             setStatus('Finalizing...');
@@ -344,6 +380,7 @@ export function useDemucs() {
             setStatus('Complete!');
             setProgress(100);
             addLog(`Finished separation in ${duration}s.`, 'success');
+            resetProcessingWorkers();
 
             setState(prev => ({
                 ...prev,
@@ -351,13 +388,15 @@ export function useDemucs() {
             }));
 
         } catch (error) {
+            resetProcessingWorkers();
             addLog(`Separation failed: ${(error as Error).message}`, 'error');
             setStatus('Error during separation');
             setState(prev => ({ ...prev, separating: false }));
         }
-    }, [state.modelLoaded, state.audioBuffer, addLog, setStatus, setProgress]);
+    }, [state.modelLoaded, state.audioBuffer, addLog, setStatus, setProgress, resetProcessingWorkers]);
 
     const resetForNewTrack = useCallback(() => {
+        resetProcessingWorkers();
         // Revoke old blob URLs to prevent memory leaks
         Object.values(stemUrls).forEach(url => URL.revokeObjectURL(url));
         if (artworkUrl) {
@@ -379,7 +418,7 @@ export function useDemucs() {
         setTrackTitle(null);
         setTrackArtist(null);
         setAudioError(null);
-    }, [stemUrls, artworkUrl]);
+    }, [stemUrls, artworkUrl, resetProcessingWorkers]);
 
     return {
         ...state,

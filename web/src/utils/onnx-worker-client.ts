@@ -64,7 +64,21 @@ export interface InferenceResult {
 
 let worker: Worker | null = null;
 let pendingResolve: ((value: WorkerResponse) => void) | null = null;
+let pendingReject: ((reason?: unknown) => void) | null = null;
 let onProgress: ((message: string) => void) | null = null;
+
+function clearPending(): void {
+    pendingResolve = null;
+    pendingReject = null;
+}
+
+function failPending(message: string): void {
+    const reject = pendingReject;
+    clearPending();
+    if (reject) {
+        reject(new Error(message));
+    }
+}
 
 /**
  * Initialize the ONNX worker
@@ -90,16 +104,13 @@ export function initWorker(): void {
 
         if (pendingResolve) {
             pendingResolve(response);
-            pendingResolve = null;
+            clearPending();
         }
     };
 
     worker.onerror = (error) => {
         console.error('[WorkerClient] Worker error:', error);
-        if (pendingResolve) {
-            pendingResolve({ type: 'load', success: false, error: error.message });
-            pendingResolve = null;
-        }
+        failPending(error.message || 'ONNX worker failed');
     };
 }
 
@@ -107,6 +118,7 @@ export function initWorker(): void {
  * Terminate the worker
  */
 export function terminateWorker(): void {
+    failPending('ONNX worker terminated');
     if (worker) {
         worker.terminate();
         worker = null;
@@ -196,8 +208,11 @@ export function isWorkerActive(): boolean {
  * Send a message to the worker and wait for response
  */
 function sendMessage(message: LoadModelMessage | RunInferenceMessage | UnloadMessage): Promise<WorkerResponse> {
-    return new Promise((resolve) => {
+    failPending('Superseded by a new ONNX request');
+
+    return new Promise((resolve, reject) => {
         pendingResolve = resolve;
+        pendingReject = reject;
         worker!.postMessage(message);
     });
 }
