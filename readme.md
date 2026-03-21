@@ -38,7 +38,7 @@ uv venv --managed-python --python 3.12
 source .venv/bin/activate
 ```
 
-Using a `uv`-managed Python is recommended because it will include the Python headers needed by PyTorch / Triton, while system Pythons on Linux may still require `python3-dev`.
+Using a `uv`-managed Python is recommended because it will include the Python headers needed by PyTorch / Triton.
 
 Then install Demucs into that environment:
 
@@ -65,8 +65,6 @@ demucs separate audio_file_1.mp3 audio_file_2.mp3
 # Separate all audio files in a directory
 demucs separate /path/to/music/folder
 ```
-
-On CUDA, the CLI uses FP16 by default. `demucs separate` also supports an opt-in `--compile` flag, but it is disabled by default because compilation adds a significant warmup cost. In our A4000 benchmarks, compiling only `HTDemucs.forward_core()` improved steady-state throughput from about `0.60s/song` to `0.34s/song` for 60-second clips, but eager execution was still faster end-to-end for a 20-song batch. Compile is best reserved for long-lived services rather than one-off CLI invocations.
 
 ## Cog Usage
 
