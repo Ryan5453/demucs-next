@@ -42,12 +42,10 @@ def export_onnx_command(
     ] = 10.0,
 ):
     """
-    Export HTDemucs model to ONNX format for browser inference.
+    Export a HTDemucs model to the ONNX format.
 
-    This is an internal developer tool for creating ONNX models
-    that can be used with ONNX Runtime Web in the browser.
+    This is an internal developer tool for creating ONNX models for deployment.
     """
-    # Default output filename to {model}.onnx if not specified
     output_path = output if output is not None else f"{model}.onnx"
 
     try:

@@ -2,8 +2,8 @@ import { useState, useCallback, useRef } from 'react';
 import type { DemucsState, LogEntry, ModelType } from '../types';
 import { SAMPLE_RATE, SEGMENT_SAMPLES } from '../types';
 import { loadModel as loadOnnxModel, unloadModel as unloadOnnxModel, runInference, getSources } from '../utils/onnx-runtime';
-import { processISTFT, initISTFTWorker, type ISTFTResult } from '../utils/istft-worker-client';
-import { processSTFT, initSTFTWorker } from '../utils/stft-worker-client';
+import { processISTFT, initISTFTWorker, terminateISTFTWorker, type ISTFTResult } from '../utils/istft-worker-client';
+import { processSTFT, initSTFTWorker, terminateSTFTWorker } from '../utils/stft-worker-client';
 import { createWavBlob } from '../utils/wav-utils';
 import { decodeAudioFile } from '../utils/audio-decoder';
 
@@ -49,6 +49,11 @@ export function useDemucs() {
         setState(prev => ({ ...prev, progress }));
     }, []);
 
+    const resetProcessingWorkers = useCallback(() => {
+        terminateSTFTWorker();
+        terminateISTFTWorker();
+    }, []);
+
     const getAudioContext = useCallback(() => {
         if (!audioContextRef.current) {
             audioContextRef.current = new AudioContext({ sampleRate: SAMPLE_RATE });
@@ -68,10 +73,11 @@ export function useDemucs() {
     }, [addLog]);
 
     const unloadModel = useCallback(async () => {
+        resetProcessingWorkers();
         await unloadOnnxModel();
         setState(prev => ({ ...prev, modelLoaded: false }));
         addLog('Model unloaded', 'info');
-    }, [addLog]);
+    }, [addLog, resetProcessingWorkers]);
 
     const clearAudioError = useCallback(() => {
         setAudioError(null);
@@ -134,6 +140,9 @@ export function useDemucs() {
         }
 
         try {
+            // Start each separation with fresh workers so a previous failed run
+            // cannot deliver stale responses into the new pipeline.
+            resetProcessingWorkers();
             setState(prev => ({ ...prev, separating: true }));
             setStemUrls({}); // Clear old URLs
             setStemWaveforms({}); // Clear old waveforms
@@ -183,8 +192,12 @@ export function useDemucs() {
 
             console.log('[Demucs] Created fade buffers');
 
-            // Pre-allocate reusable buffers to reduce GC pressure
-            const segmentPlanar = new Float32Array(SEGMENT_SAMPLES * numChannels);
+            // Double-buffer planar audio so the next segment can be prepared
+            // without mutating the buffer currently being read by inference.
+            const planarBuffers = [
+                new Float32Array(SEGMENT_SAMPLES * numChannels),
+                new Float32Array(SEGMENT_SAMPLES * numChannels),
+            ];
             console.log('[Demucs] Initializing workers...');
             initSTFTWorker();
             initISTFTWorker();
@@ -220,14 +233,18 @@ export function useDemucs() {
                 return interleaved;
             }
 
-            function preparePlanar(segStart: number, segLength: number): Float32Array {
-                segmentPlanar.fill(0);
+            function preparePlanar(
+                buffer: Float32Array,
+                segStart: number,
+                segLength: number
+            ): Float32Array {
+                buffer.fill(0);
                 for (let i = 0; i < segLength; i++) {
                     const srcIdx = (segStart + i) * numChannels;
-                    segmentPlanar[i] = audio[srcIdx];
-                    segmentPlanar[SEGMENT_SAMPLES + i] = audio[srcIdx + 1];
+                    buffer[i] = audio[srcIdx];
+                    buffer[SEGMENT_SAMPLES + i] = audio[srcIdx + 1];
                 }
-                return segmentPlanar;
+                return buffer;
             }
 
             // Kick off STFT for first segment
@@ -235,7 +252,8 @@ export function useDemucs() {
             const seg0End = Math.min(SEGMENT_SAMPLES, numSamples);
             const seg0Length = seg0End - seg0Start;
             let pendingStft = processSTFT(prepareSegmentInterleaved(seg0Start, seg0Length));
-            let pendingPlanar = preparePlanar(seg0Start, seg0Length);
+            let pendingPlanarIndex = 0;
+            let pendingPlanar = preparePlanar(planarBuffers[pendingPlanarIndex], seg0Start, seg0Length);
 
             for (let seg = 0; seg < numSegments; seg++) {
                 const segStart = seg * STEP;
@@ -272,7 +290,12 @@ export function useDemucs() {
                     const nextSegEnd = Math.min(nextSegStart + SEGMENT_SAMPLES, numSamples);
                     const nextSegLength = nextSegEnd - nextSegStart;
                     pendingStft = processSTFT(prepareSegmentInterleaved(nextSegStart, nextSegLength));
-                    pendingPlanar = preparePlanar(nextSegStart, nextSegLength);
+                    pendingPlanarIndex = 1 - pendingPlanarIndex;
+                    pendingPlanar = preparePlanar(
+                        planarBuffers[pendingPlanarIndex],
+                        nextSegStart,
+                        nextSegLength
+                    );
                 }
 
                 // Await the GPU result
@@ -357,6 +380,7 @@ export function useDemucs() {
             setStatus('Complete!');
             setProgress(100);
             addLog(`Finished separation in ${duration}s.`, 'success');
+            resetProcessingWorkers();
 
             setState(prev => ({
                 ...prev,
@@ -364,13 +388,15 @@ export function useDemucs() {
             }));
 
         } catch (error) {
+            resetProcessingWorkers();
             addLog(`Separation failed: ${(error as Error).message}`, 'error');
             setStatus('Error during separation');
             setState(prev => ({ ...prev, separating: false }));
         }
-    }, [state.modelLoaded, state.audioBuffer, addLog, setStatus, setProgress]);
+    }, [state.modelLoaded, state.audioBuffer, addLog, setStatus, setProgress, resetProcessingWorkers]);
 
     const resetForNewTrack = useCallback(() => {
+        resetProcessingWorkers();
         // Revoke old blob URLs to prevent memory leaks
         Object.values(stemUrls).forEach(url => URL.revokeObjectURL(url));
         if (artworkUrl) {
@@ -392,7 +418,7 @@ export function useDemucs() {
         setTrackTitle(null);
         setTrackArtist(null);
         setAudioError(null);
-    }, [stemUrls, artworkUrl]);
+    }, [stemUrls, artworkUrl, resetProcessingWorkers]);
 
     return {
         ...state,

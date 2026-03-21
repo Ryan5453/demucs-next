@@ -7,6 +7,7 @@
 from io import BytesIO
 
 from cog import BaseModel, BasePredictor, Input, Path
+import torch
 
 from demucs import ModelRepository, Separator, select_model
 
@@ -30,8 +31,11 @@ class Predictor(BasePredictor):
         for model_name in repo.list_models().keys():
             separator = Separator(
                 model=model_name,
+                dtype=torch.float16 if torch.cuda.is_available() else None,
                 compile=True,
             )
+            if torch.cuda.is_available():
+                separator.warmup(batch_sizes=[4, 1])
             self.separators[model_name] = separator
 
     def predict(
@@ -83,7 +87,7 @@ class Predictor(BasePredictor):
             description="Overlap between split chunks, higher values improve quality at chunk boundaries",
             default=0.25,
             ge=0.0,
-            le=1.0,
+            lt=1.0,
         ),
         clip_mode: str = Input(
             description="Method to prevent audio clipping in output, or None for no clipping prevention",

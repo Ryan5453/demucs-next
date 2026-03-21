@@ -45,7 +45,6 @@ def format_output_path(
     :return: Resolved output path
     """
     now = datetime.now()
-    # Template variables
     variables = {
         "model": model,
         "track": track.name.rsplit(".", 1)[0],
@@ -56,7 +55,6 @@ def format_output_path(
         "timestamp": str(int(now.timestamp())),
     }
 
-    # Replace all variables in the template
     formatted_path = template
     for var, value in variables.items():
         formatted_path = formatted_path.replace(f"{{{var}}}", value)
@@ -69,54 +67,26 @@ def get_models() -> dict[str, dict]:
     Get models from metadata.json.
 
     :return: Dictionary mapping model names to their metadata
-    :raises RuntimeError: If the metadata structure is invalid
     """
     with open(METADATA_PATH, "r") as f:
         metadata = json.load(f)
 
-    # Support both old and new metadata structure
-    if "models" in metadata:
-        return metadata["models"]
-    elif "collections" in metadata:
-        return metadata["collections"]
-    else:
-        raise RuntimeError("Invalid metadata structure: no models or collections found")
-
-
-def _get_common_audio_extensions() -> set[str]:
-    """
-    Get a set of common audio file extensions.
-
-    :return: Set of file extension strings including the leading dot
-    """
-    # Common audio/video formats that typically contain audio streams
-    # Note: This is just a heuristic for performance - torchcodec determines actual support
-    return {
-        ".mp3",
-        ".wav",
-        ".flac",
-        ".m4a",
-        ".aac",
-        ".ogg",
-        ".opus",
-        ".mp4",
-        ".webm",
-        ".mkv",
-        ".avi",
-        ".mov",
-        ".wma",
-        ".alac",
-    }
+    return metadata["models"]
 
 
 def _looks_like_audio_file(path: Path) -> bool:
     """
-    Fast heuristic check if a file might be audio based on extension.
+    Heuristic check if a file might be audio based on extension.
+    This is purely for performance in big folders, torchcodec will determine actual support.
 
     :param path: Path to check
     :return: True if the file extension matches a known audio format
     """
-    return path.suffix.lower() in _get_common_audio_extensions()
+    return path.suffix.lower() in {
+        ".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus",
+        ".mp4", ".webm", ".mkv", ".avi", ".mov", ".wma", ".alac",
+        ".aiff", ".aif", ".aifc", ".m4b", ".m4p", ".m4r", ".m4v"
+    }
 
 
 def expand_paths_to_audio_files(paths: list[Path]) -> list[Path]:
@@ -131,7 +101,7 @@ def expand_paths_to_audio_files(paths: list[Path]) -> list[Path]:
     for path in paths:
         if path.is_file():
             # For individual files, just add them and let torchcodec handle validation
-            # This allows users to try any file they want
+            # This allows users to try any file they want (including obscure formats FFmpeg can handle)
             audio_files.append(path)
         elif path.is_dir():
             # For directories, use extension heuristic for performance
@@ -142,7 +112,6 @@ def expand_paths_to_audio_files(paths: list[Path]) -> list[Path]:
             found_files = [f for f in all_files if _looks_like_audio_file(f)]
 
             if found_files:
-                # Sort files for consistent processing order
                 found_files.sort()
                 audio_files.extend(found_files)
             else:

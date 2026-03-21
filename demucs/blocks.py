@@ -468,7 +468,7 @@ class HEncLayer(nn.Module):
         dconv: bool = True,
         norm: bool = True,
         context: int = 0,
-        dconv_kw: dict = {},
+        dconv_kw: dict | None = None,
         pad: bool = True,
         rewrite: bool = True,
     ) -> None:
@@ -489,6 +489,7 @@ class HEncLayer(nn.Module):
         :param rewrite: If True, add 1x1 conv at the end of the layer
         """
         super().__init__()
+        dconv_kw = dconv_kw or {}
         norm_fn = lambda d: nn.Identity()  # noqa
         if norm:
             norm_fn = lambda d: nn.GroupNorm(norm_groups, d)  # noqa
@@ -679,7 +680,7 @@ class HDecLayer(nn.Module):
         dconv: bool = True,
         norm: bool = True,
         context: int = 1,
-        dconv_kw: dict = {},
+        dconv_kw: dict | None = None,
         pad: bool = True,
         context_freq: bool = True,
         rewrite: bool = True,
@@ -703,6 +704,7 @@ class HDecLayer(nn.Module):
         :param rewrite: If True, add 1x1 conv at the start of the layer
         """
         super().__init__()
+        dconv_kw = dconv_kw or {}
         norm_fn = lambda d: nn.Identity()  # noqa
         if norm:
             norm_fn = lambda d: nn.GroupNorm(norm_groups, d)  # noqa

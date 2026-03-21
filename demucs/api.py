@@ -21,6 +21,7 @@ from .exceptions import (
     ModelLoadingError,
     ValidationError,
 )
+from .htdemucs import HTDemucs
 from .repo import ModelRepository
 
 
@@ -125,6 +126,62 @@ class Separator:
     Audio source separation using Demucs models.
     """
 
+    @staticmethod
+    def _compile_htdemucs_forward_core(model: HTDemucs) -> None:
+        """
+        Compile only the heavy neural network core of HTDemucs.
+
+        This avoids pulling the complex STFT/iSTFT path into TorchInductor,
+        which significantly reduces compile overhead while preserving most of
+        the steady-state speedup on long-lived CUDA workloads.
+
+        :param model: HTDemucs model to compile
+        """
+        model.forward_core = torch.compile(model.forward_core, mode="reduce-overhead")
+
+    @staticmethod
+    def _warmup_htdemucs_forward_core(model: HTDemucs, batch_sizes: list[int]) -> None:
+        """
+        Warm the compiled HTDemucs neural network core for specific batch sizes.
+
+        :param model: HTDemucs model whose compiled core should be warmed
+        :param batch_sizes: Batch sizes to warm up for
+        """
+        if any(batch_size < 1 for batch_size in batch_sizes):
+            raise ValidationError(
+                f"warmup batch sizes must be positive integers, got {batch_sizes}"
+            )
+
+        training_length = int(model.max_allowed_segment * model.samplerate)
+        model_dtype = next(model.parameters()).dtype
+
+        with torch.no_grad():
+            for batch_size in batch_sizes:
+                mix = torch.zeros(
+                    batch_size,
+                    model.audio_channels,
+                    training_length,
+                    device="cuda",
+                    dtype=torch.float32,
+                )
+                z = model._spec(mix)
+                x = model._magnitude(z).to(mix.device)
+
+                mean = x.mean(dim=(1, 2, 3), keepdim=True)
+                std = x.std(dim=(1, 2, 3), keepdim=True)
+                x = (x - mean) / (1e-5 + std)
+
+                xt = mix
+                meant = xt.mean(dim=(1, 2), keepdim=True)
+                stdt = xt.std(dim=(1, 2), keepdim=True)
+                xt = (xt - meant) / (1e-5 + stdt)
+
+                if model_dtype != torch.float32:
+                    x = x.to(model_dtype)
+                    xt = xt.to(model_dtype)
+
+                model.forward_core(x, xt)
+
     def __init__(
         self,
         model: str | Model | ModelEnsemble = "htdemucs",
@@ -211,28 +268,52 @@ class Separator:
             else:
                 self.model.to(dtype=self.dtype)
 
-        # torch.compile: JIT-compile for fused kernels and reduced launch overhead.
-        # reduce-overhead mode enables CUDA graphs for minimal kernel launch cost.
-        # Disabled by default because compilation adds ~30s to init time.
+        # torch.compile: compile only the neural network core of HTDemucs.
+        # This avoids compiling STFT/iSTFT and complex tensor ops, which are
+        # a poor fit for Inductor and significantly increase startup latency.
         if compile and self.device == "cuda":
             if isinstance(self.model, ModelEnsemble):
-                for i, m in enumerate(self.model.models):
-                    self.model.models[i] = torch.compile(
-                        m, mode="reduce-overhead"
-                    )
+                for sub_model in self.model.models:
+                    if isinstance(sub_model, HTDemucs):
+                        self._compile_htdemucs_forward_core(sub_model)
             else:
-                self.model = torch.compile(self.model, mode="reduce-overhead")
+                if isinstance(self.model, HTDemucs):
+                    self._compile_htdemucs_forward_core(self.model)
 
-            # Warmup pass with synthetic audio to trigger compilation now
-            # rather than on the first real call.
-            warmup = torch.zeros(
-                1, self.audio_channels, self.sample_rate, device=self.device
-            )
-            if self.dtype is not None:
-                warmup = warmup.to(dtype=self.dtype)
-            with torch.no_grad():
-                self.model(warmup)
-            del warmup
+    def warmup(self, batch_sizes: list[int]) -> None:
+        """
+        Warm the compiled HTDemucs path for specific batch sizes.
+
+        This is most useful for long-lived CUDA services such as Cog/Replicate
+        deployments, where it is preferable to pay the compilation cost during
+        setup rather than on the first live request.
+
+        :param batch_sizes: Batch sizes to warm up for, e.g. ``[4, 1]`` for a
+            common split batch plus the single-item tail batch
+        :raises ValidationError: If called on CPU/MPS or if batch sizes are invalid
+        """
+        if self.device != "cuda":
+            raise ValidationError("warmup() is only supported for CUDA separators.")
+
+        if not batch_sizes:
+            raise ValidationError("warmup() requires at least one batch size.")
+
+        if isinstance(self.model, ModelEnsemble):
+            warmed_any = False
+            for sub_model in self.model.models:
+                if isinstance(sub_model, HTDemucs):
+                    self._warmup_htdemucs_forward_core(sub_model, batch_sizes)
+                    warmed_any = True
+            if not warmed_any:
+                raise ValidationError(
+                    "warmup() is only supported for HTDemucs-based models."
+                )
+        else:
+            if not isinstance(self.model, HTDemucs):
+                raise ValidationError(
+                    "warmup() is only supported for HTDemucs-based models."
+                )
+            self._warmup_htdemucs_forward_core(self.model, batch_sizes)
 
     def _to_tensor(self, audio: tuple[Tensor, int] | Path | str | bytes) -> Tensor:
         """
@@ -338,10 +419,10 @@ class Separator:
         if (
             not isinstance(split_overlap, (int, float))
             or split_overlap < 0.0
-            or split_overlap > 1.0
+            or split_overlap >= 1.0
         ):
             raise ValidationError(
-                f"split_overlap must be a float between 0.0 and 1.0 (inclusive), got {split_overlap}"
+                f"split_overlap must be a float between 0.0 (inclusive) and 1.0 (exclusive), got {split_overlap}"
             )
 
         # Validate and adjust split_size parameter
@@ -372,6 +453,7 @@ class Separator:
 
         # Normalize input to tensor
         wav = self._to_tensor(audio)
+        original = wav.clone()
 
         # Separation logic (inlined)
         ref = wav.mean(0)
@@ -396,7 +478,7 @@ class Separator:
         for source_idx, source_name in enumerate(self.model.sources):
             sources[source_name] = sources_tensor[source_idx] * std + mean
 
-        return SeparatedSources(sources, self.sample_rate, original=wav)
+        return SeparatedSources(sources, self.sample_rate, original=original)
 
 
 def select_model(

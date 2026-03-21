@@ -24,8 +24,8 @@ class StemName(str, Enum):
     bass = "bass"
     other = "other"
     vocals = "vocals"
-    guitar = "guitar"
-    piano = "piano"
+    guitar = "guitar" # Only provided by htdemucs_6s
+    piano = "piano" # Only provided by htdemucs_6s
 
 
 class ClipMode(str, Enum):

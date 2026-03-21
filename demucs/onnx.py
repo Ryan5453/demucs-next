@@ -118,7 +118,6 @@ def export_to_onnx(
     output_path: str | None = None,
     opset_version: int = 17,
     segment_seconds: float = 10.0,
-    fp16: bool = False,
 ) -> str:
     """
     Export Demucs model to ONNX format.
@@ -127,8 +126,6 @@ def export_to_onnx(
     :param output_path: Path to save the ONNX model (defaults to {model_name}.onnx)
     :param opset_version: ONNX opset version
     :param segment_seconds: Audio segment length in seconds
-    :param fp16: If True, convert model weights to float16 for smaller size and faster
-        WebGPU inference. Inputs/outputs remain float32.
     :return: Path to the exported ONNX model
     :raises ImportError: If the onnx package is not installed
     :raises ValueError: If the model is not an HTDemucs instance
@@ -142,8 +139,7 @@ def export_to_onnx(
         )
 
     if output_path is None:
-        suffix = "_fp16" if fp16 else ""
-        output_path = f"{model_name}{suffix}.onnx"
+        output_path = f"{model_name}.onnx"
 
     repo = ModelRepository()
     model = repo.get_model(model_name)
@@ -203,24 +199,6 @@ def export_to_onnx(
     channels_meta = onnx_model.metadata_props.add()
     channels_meta.key = "audio_channels"
     channels_meta.value = str(model.audio_channels)
-
-    if fp16:
-        from onnxruntime.transformers.float16 import convert_float_to_float16
-
-        onnx_model = convert_float_to_float16(
-            onnx_model,
-            keep_io_types=True,
-            op_block_list=[
-                "LayerNormalization",
-                "InstanceNormalization",
-                "ReduceMean",
-                "Softmax",
-                "Pow",
-                "Sqrt",
-                "Range",
-                "Mod",
-            ],
-        )
 
     onnx.save(onnx_model, output_path)
 

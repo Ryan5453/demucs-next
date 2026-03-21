@@ -1,43 +1,22 @@
 # demucs-next
 
 > [!WARNING]
-> `demucs-next` is still in an alpha state and is not recommended for production use. A stable release will be released soon.
+> `demucs-next` is still in development not recommended for production use.
 
-Demucs is a state-of-the-art music source separation model capable of separating drums, bass, and vocals from the rest of the accompaniment.
-This is a fork of the [author](https://github.com/adefossez)'s [fork](https://github.com/adefossez/demucs) of the [original Demucs repository](https://github.com/facebookresearch/demucs). It has been updated to use modern versions of Python, PyTorch, and TorchCodec.
+Demucs is a SOTA music source separation model capable of separating drums, bass, and vocals from the rest of the accompaniment.
+This is a fork of the [author's fork](https://github.com/adefossez/demucs) of the original Demucs repository. 
+
+`demucs-next` has been updated to use modern versions of Python, PyTorch, and TorchCodec. It is significantly faster and easier to use than upstream Demucs.
 
 ## Installation
 
 ### Prerequisites
 
-#### FFmpeg
+Before installing Demucs, make sure your system has:
 
-Demucs requires[^1] FFmpeg v4+ to be installed on your system. You can install it using the following command:
-
-[^1]: You can use the Python API without FFmpeg, as you have the option to provide the audio as a Tensor.
-
-```bash
-# macOS
-brew install ffmpeg
-
-# Ubuntu/Debian
-sudo apt-get install ffmpeg
-
-# Windows
-choco install ffmpeg
-```
-
-#### UV
-
-The recommended way to install demucs-inference is to use UV. You can install it using the following command:
-
-```bash
-# macOS/Linux
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Windows PowerShell
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
+- FFmpeg v4+ installed and available your on `PATH`
+- [`uv`](https://docs.astral.sh/uv/#installation)
+- Optionally, a working C/C++ compiler such as `g++` if you plan to use `--compile`
 
 ### Temporary Installation using UV
 
@@ -51,23 +30,23 @@ uvx demucs-next separate audio_file.mp3
 
 ### Install using UV
 
-Install Demucs using the following command:
+Create a virtual environment backed by a `uv`-managed Python:
+
+```bash
+uv python install 3.12
+uv venv --managed-python --python 3.12
+source .venv/bin/activate
+```
+
+Using a `uv`-managed Python is recommended because it will include the Python headers needed by PyTorch / Triton, while system Pythons on Linux may still require `python3-dev`.
+
+Then install Demucs into that environment:
 
 ```bash
 uv pip install demucs-next --torch-backend=auto
 ```
 
 The `--torch-backend=auto` flag automatically detects your GPU and installs the appropriate version of PyTorch compatible with your system.
-
-### Install without UV
-
-Install Demucs using the following command:
-
-```bash
-pip install demucs-next
-```
-
-**Note**: Demucs does not specify a specific PyTorch wheel. If you want to use a GPU, view the [PyTorch installation guide](https://pytorch.org/get-started/locally/) and append the correct index URL.
 
 ## Usage
 
@@ -86,6 +65,8 @@ demucs separate audio_file_1.mp3 audio_file_2.mp3
 # Separate all audio files in a directory
 demucs separate /path/to/music/folder
 ```
+
+On CUDA, the CLI uses FP16 by default. `demucs separate` also supports an opt-in `--compile` flag, but it is disabled by default because compilation adds a significant warmup cost. In our A4000 benchmarks, compiling only `HTDemucs.forward_core()` improved steady-state throughput from about `0.60s/song` to `0.34s/song` for 60-second clips, but eager execution was still faster end-to-end for a 20-song batch. Compile is best reserved for long-lived services rather than one-off CLI invocations.
 
 ## Cog Usage
 

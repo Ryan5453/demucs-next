@@ -26,9 +26,6 @@ export interface STFTResult {
     numFrames: number;
 }
 
-export const SOURCES = ['drums', 'bass', 'other', 'vocals'] as const;
-export type SourceName = typeof SOURCES[number];
-
 export const SAMPLE_RATE = 44100;
 export const NFFT = 4096;
 export const HOP_LENGTH = NFFT / 4;

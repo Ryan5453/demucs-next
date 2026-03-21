@@ -6,6 +6,20 @@ import type { STFTResult } from '../types';
 
 let worker: Worker | null = null;
 let pendingResolve: ((result: STFTResult) => void) | null = null;
+let pendingReject: ((error: Error) => void) | null = null;
+
+function clearPending(): void {
+    pendingResolve = null;
+    pendingReject = null;
+}
+
+function failPending(message: string): void {
+    const reject = pendingReject;
+    clearPending();
+    if (reject) {
+        reject(new Error(message));
+    }
+}
 
 export function initSTFTWorker(): void {
     if (worker) return;
@@ -18,17 +32,20 @@ export function initSTFTWorker(): void {
     worker.onmessage = (event: MessageEvent<STFTResult & { type: string }>) => {
         if (pendingResolve) {
             pendingResolve(event.data);
-            pendingResolve = null;
+            clearPending();
         }
     };
 
     worker.onerror = (error) => {
         console.error('[STFTWorker] Error:', error);
-        pendingResolve = null;
+        failPending(error.message || 'STFT worker failed');
+        worker?.terminate();
+        worker = null;
     };
 }
 
 export function terminateSTFTWorker(): void {
+    failPending('STFT worker terminated');
     if (worker) {
         worker.terminate();
         worker = null;
@@ -40,8 +57,9 @@ export function processSTFT(segmentInterleaved: Float32Array): Promise<STFTResul
         initSTFTWorker();
     }
 
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
         pendingResolve = resolve;
+        pendingReject = reject;
         worker!.postMessage(
             { type: 'process', segmentInterleaved },
             [segmentInterleaved.buffer] as unknown as Transferable[]

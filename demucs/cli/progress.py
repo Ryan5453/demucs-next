@@ -3,9 +3,6 @@
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-
-"""Progress bar utilities for the Demucs CLI."""
-
 from collections.abc import Callable
 
 from rich.progress import (
@@ -56,7 +53,6 @@ def create_progress_callback(progress_bar: Progress, task: TaskID) -> Callable[[
                 description=f"[cyan]Downloading {data['model_name']}[/cyan] - Layer {data['layer_index']}/{data['total_layers']}",
             )
         elif event_type == "layer_progress":
-            # Calculate overall progress: (completed_layers + current_layer_progress) / total_layers
             layer_base = (data["layer_index"] - 1) / data["total_layers"] * 100
             layer_progress = data["progress_percent"] / data["total_layers"]
             overall_progress = layer_base + layer_progress
@@ -113,7 +109,9 @@ def create_file_progress_bar() -> Progress:
 
 
 class FileProgressTracker:
-    """Tracks progress across multiple files with improved UX."""
+    """
+    Tracks separation progress across multiple files.
+    """
 
     def __init__(self, total_files: int) -> None:
         """
@@ -186,7 +184,6 @@ class FileProgressTracker:
                 description=filename.strip(),
             )
         elif event_type == "processing_complete":
-            # Complete the task which will show the checkmark in the spinner column
             self.progress_bar.update(
                 task_id, completed=data["total_chunks"], description=filename.strip()
             )
@@ -203,7 +200,6 @@ class FileProgressTracker:
             return
 
         task_id = self.file_tasks[filename]
-        # Complete the task to stop spinner and show red error mark
         self.progress_bar.update(
             task_id, completed=100, description=f"[red]✗[/red] {filename.strip()}"
         )

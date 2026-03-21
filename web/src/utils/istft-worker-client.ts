@@ -29,6 +29,20 @@ export interface ISTFTResult {
 
 let worker: Worker | null = null;
 let pendingResolve: ((result: ISTFTResult) => void) | null = null;
+let pendingReject: ((error: Error) => void) | null = null;
+
+function clearPending(): void {
+    pendingResolve = null;
+    pendingReject = null;
+}
+
+function failPending(message: string): void {
+    const reject = pendingReject;
+    clearPending();
+    if (reject) {
+        reject(new Error(message));
+    }
+}
 
 export function initISTFTWorker(): void {
     if (worker) return;
@@ -41,17 +55,20 @@ export function initISTFTWorker(): void {
     worker.onmessage = (event: MessageEvent<ISTFTResult & { type: string }>) => {
         if (pendingResolve) {
             pendingResolve(event.data);
-            pendingResolve = null;
+            clearPending();
         }
     };
 
     worker.onerror = (error) => {
         console.error('[ISTFTWorker] Error:', error);
-        pendingResolve = null;
+        failPending(error.message || 'ISTFT worker failed');
+        worker?.terminate();
+        worker = null;
     };
 }
 
 export function terminateISTFTWorker(): void {
+    failPending('ISTFT worker terminated');
     if (worker) {
         worker.terminate();
         worker = null;
@@ -63,8 +80,9 @@ export function processISTFT(request: ISTFTRequest): Promise<ISTFTResult> {
         initISTFTWorker();
     }
 
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
         pendingResolve = resolve;
+        pendingReject = reject;
         worker!.postMessage({
             type: 'process',
             ...request,

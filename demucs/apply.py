@@ -315,6 +315,10 @@ def apply_model(
         assert segment is not None and segment > 0.0
         segment_length: int = int(model.samplerate * segment)
         stride = int((1 - overlap) * segment_length)
+        if stride < 1:
+            raise ValueError(
+                f"split overlap {overlap} produces an invalid stride for segment length {segment_length}"
+            )
         offsets = range(0, length, stride)
         # We start from a triangle shaped weight, with maximal weight in the middle
         # of the segment. Then we normalize and take to the power `transition_power`.
