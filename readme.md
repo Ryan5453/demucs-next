@@ -1,7 +1,7 @@
 # demucs-next
 
 > [!WARNING]
-> `demucs-next` is still in an alpha state and is not recommended for production use. A stable release will be released soon.
+> `demucs-next` is still in alpha not recommended for production use.
 
 Demucs is a state-of-the-art music source separation model capable of separating drums, bass, and vocals from the rest of the accompaniment.
 This is a fork of the [author](https://github.com/adefossez)'s [fork](https://github.com/adefossez/demucs) of the [original Demucs repository](https://github.com/facebookresearch/demucs). It has been updated to use modern versions of Python, PyTorch, and TorchCodec.
@@ -12,32 +12,9 @@ This is a fork of the [author](https://github.com/adefossez)'s [fork](https://gi
 
 #### FFmpeg
 
-Demucs requires[^1] FFmpeg v4+ to be installed on your system. You can install it using the following command:
-
-[^1]: You can use the Python API without FFmpeg, as you have the option to provide the audio as a Tensor.
-
-```bash
-# macOS
-brew install ffmpeg
-
-# Ubuntu/Debian
-sudo apt-get install ffmpeg
-
-# Windows
-choco install ffmpeg
-```
-
-#### UV
-
-The recommended way to install demucs-inference is to use UV. You can install it using the following command:
-
-```bash
-# macOS/Linux
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Windows PowerShell
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
+- FFmpeg v4+ available in your `PATH`
+- [`uv`](https://docs.astral.sh/uv/#installation)
+- Optionally, a working C/C++ compiler such as `g++` if you plan to use `--compile`
 
 ### Temporary Installation using UV
 
@@ -51,7 +28,17 @@ uvx demucs-next separate audio_file.mp3
 
 ### Install using UV
 
-Install Demucs using the following command:
+Create a virtual environment backed by a `uv`-managed Python:
+
+```bash
+uv python install 3.12
+uv venv --managed-python --python 3.12
+source .venv/bin/activate
+```
+
+Using a `uv`-managed Python is recommended because it will include the Python headers needed by PyTorch / Triton.
+
+Then install Demucs into that environment:
 
 ```bash
 uv pip install demucs-next --torch-backend=auto

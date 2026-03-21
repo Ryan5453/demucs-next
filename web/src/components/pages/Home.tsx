@@ -53,7 +53,8 @@ export function Home() {
     const [selectedModel, setSelectedModel] = useState<ModelType>('htdemucs');
     const [selectedBackend, setSelectedBackend] = useState<ExecutionBackend>('webgpu');
     const [volumes, setVolumes] = useState<Record<string, number>>({});
-    const [playingStems, setPlayingStems] = useState<Record<string, boolean>>({});
+    const [mutedStems, setMutedStems] = useState<Record<string, boolean>>({});
+    const [isTransportPlaying, setIsTransportPlaying] = useState(false);
     const [currentTime, setCurrentTime] = useState(0);
     const [isDragging, setIsDragging] = useState(false);
     const audioRefs = useRef<Record<string, HTMLAudioElement>>({});
@@ -67,31 +68,43 @@ export function Home() {
     const duration = audioBuffer?.duration ?? 0;
     const stems = Object.keys(stemUrls);
     const hasStemsReady = stems.length > 0;
-    const isAnyPlaying = Object.values(playingStems).some(Boolean);
+
+    const getPlaybackVolume = (stemName: string) => {
+        if (mutedStems[stemName]) return 0;
+        return (volumes[stemName] ?? 80) / 100;
+    };
 
     // Sync volumes
     useEffect(() => {
         Object.keys(audioRefs.current).forEach(key => {
             const audio = audioRefs.current[key];
             if (audio) {
-                audio.volume = (volumes[key] ?? 80) / 100;
+                audio.volume = getPlaybackVolume(key);
             }
         });
-    }, [volumes]);
+    }, [mutedStems, volumes]);
 
     // Time sync
     useEffect(() => {
+        if (!isTransportPlaying) return;
+
         const interval = setInterval(() => {
-            const firstPlaying = Object.entries(playingStems).find(([, playing]) => playing);
-            if (firstPlaying) {
-                const audio = audioRefs.current[firstPlaying[0]];
-                if (audio) {
-                    setCurrentTime(audio.currentTime);
-                }
+            const referenceStem = stems[0] ?? (mergedStemUrl ? 'merged' : undefined);
+            if (!referenceStem) return;
+
+            const audio = audioRefs.current[referenceStem];
+            if (audio) {
+                setCurrentTime(audio.currentTime);
             }
         }, 100);
         return () => clearInterval(interval);
-    }, [playingStems]);
+    }, [isTransportPlaying, mergedStemUrl, stems]);
+
+    useEffect(() => {
+        setMutedStems({});
+        setIsTransportPlaying(false);
+        setCurrentTime(0);
+    }, [stemUrls, mergedStemUrl]);
 
     const handleModelChange = async (model: ModelType) => {
         if (modelLoaded && selectedModel === model) return;
@@ -144,43 +157,55 @@ export function Home() {
         const audio = audioRefs.current[stemName];
         if (!audio) return;
 
-        if (playingStems[stemName]) {
-            audio.pause();
-            setPlayingStems(prev => ({ ...prev, [stemName]: false }));
-        } else {
-            audio.play();
-            setPlayingStems(prev => ({ ...prev, [stemName]: true }));
+        if (!isTransportPlaying) {
+            void playAll();
         }
+
+        setMutedStems(prev => {
+            const nextMuted = !prev[stemName];
+            audio.volume = nextMuted ? 0 : getPlaybackVolume(stemName);
+            return { ...prev, [stemName]: nextMuted };
+        });
     };
 
-    const playAll = () => {
-        stems.forEach(stem => {
+    const getTransportStemKeys = () => {
+        const stemKeys = [...stems];
+        if (mergedStemUrl) {
+            stemKeys.push('merged');
+        }
+        return stemKeys;
+    };
+
+    const playAll = async () => {
+        const transportStemKeys = getTransportStemKeys();
+        await Promise.all(transportStemKeys.map(async stem => {
             const audio = audioRefs.current[stem];
             if (audio) {
                 audio.currentTime = currentTime;
-                audio.play();
-                setPlayingStems(prev => ({ ...prev, [stem]: true }));
+                audio.volume = getPlaybackVolume(stem);
+                await audio.play();
             }
-        });
+        }));
+        setIsTransportPlaying(true);
     };
 
     const pauseAll = () => {
-        stems.forEach(stem => {
+        getTransportStemKeys().forEach(stem => {
             const audio = audioRefs.current[stem];
             if (audio) audio.pause();
         });
-        setPlayingStems({});
+        setIsTransportPlaying(false);
     };
 
     const stopAll = () => {
-        stems.forEach(stem => {
+        getTransportStemKeys().forEach(stem => {
             const audio = audioRefs.current[stem];
             if (audio) {
                 audio.pause();
                 audio.currentTime = 0;
             }
         });
-        setPlayingStems({});
+        setIsTransportPlaying(false);
         setCurrentTime(0);
     };
 
@@ -306,14 +331,14 @@ export function Home() {
                         key={stemKey}
                         ref={el => { if (el) audioRefs.current[stemKey] = el; }}
                         src={stemUrls[stemKey]}
-                        onEnded={() => setPlayingStems(prev => ({ ...prev, [stemKey]: false }))}
+                        onEnded={() => setIsTransportPlaying(false)}
                     />
                 ))}
                 {mergedStemUrl && (
                     <audio
                         ref={el => { if (el) audioRefs.current['merged'] = el; }}
                         src={mergedStemUrl}
-                        onEnded={() => setPlayingStems(prev => ({ ...prev, merged: false }))}
+                        onEnded={() => setIsTransportPlaying(false)}
                     />
                 )}
 
@@ -332,7 +357,7 @@ export function Home() {
                             <div className="award-frame-inner">
                                 {/* Gold Vinyl */}
                                 <Vinyl
-                                    spinning={separating || isAnyPlaying}
+                                    spinning={separating || isTransportPlaying}
                                     artworkUrl={artworkUrl}
                                     progress={separating ? progress : undefined}
                                 />
@@ -393,9 +418,9 @@ export function Home() {
                                     </button>
                                     <button 
                                         className="transport-btn primary" 
-                                        onClick={isAnyPlaying ? pauseAll : playAll}
+                                        onClick={isTransportPlaying ? pauseAll : () => { void playAll(); }}
                                     >
-                                        {isAnyPlaying ? (
+                                        {isTransportPlaying ? (
                                             <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
                                                 <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" />
                                             </svg>
@@ -425,7 +450,7 @@ export function Home() {
                                                 color={style.color}
                                                 colorRgb={style.colorRgb}
                                                 volume={volumes[stemKey] ?? 80}
-                                                isPlaying={playingStems[stemKey] || false}
+                                                isPlaying={isTransportPlaying && !mutedStems[stemKey]}
                                                 isMergeMode={mergeMode}
                                                 isSelected={selectedStems.has(stemKey)}
                                                 onVolumeChange={(v) => setVolumes(prev => ({ ...prev, [stemKey]: v }))}
@@ -442,7 +467,7 @@ export function Home() {
                                             color="#c9a227"
                                             colorRgb="201, 162, 39"
                                             volume={volumes['merged'] ?? 80}
-                                            isPlaying={playingStems['merged'] || false}
+                                            isPlaying={isTransportPlaying && !mutedStems.merged}
                                             isMergeMode={false}
                                             isSelected={false}
                                             onVolumeChange={(v) => setVolumes(prev => ({ ...prev, merged: v }))}
