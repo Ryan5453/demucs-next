@@ -63,15 +63,26 @@ export function Home() {
     const [mergeMode, setMergeMode] = useState(false);
     const [selectedStems, setSelectedStems] = useState<Set<string>>(new Set());
     const [mergedStemUrl, setMergedStemUrl] = useState<string | null>(null);
+    const [mergedStemMembers, setMergedStemMembers] = useState<string[]>([]);
     const [isMerging, setIsMerging] = useState(false);
 
     const duration = audioBuffer?.duration ?? 0;
     const stems = Object.keys(stemUrls);
     const hasStemsReady = stems.length > 0;
+    const mergedMemberSet = new Set(mergedStemMembers);
+    const visibleStemKeys = stems.filter(stem => !mergedMemberSet.has(stem));
 
     const getPlaybackVolume = (stemName: string) => {
         if (mutedStems[stemName]) return 0;
         return (volumes[stemName] ?? 80) / 100;
+    };
+
+    const getTransportStemKeys = () => {
+        const stemKeys = [...visibleStemKeys];
+        if (mergedStemUrl) {
+            stemKeys.push('merged');
+        }
+        return stemKeys;
     };
 
     // Sync volumes
@@ -89,7 +100,7 @@ export function Home() {
         if (!isTransportPlaying) return;
 
         const interval = setInterval(() => {
-            const referenceStem = stems[0] ?? (mergedStemUrl ? 'merged' : undefined);
+            const referenceStem = getTransportStemKeys()[0];
             if (!referenceStem) return;
 
             const audio = audioRefs.current[referenceStem];
@@ -98,13 +109,43 @@ export function Home() {
             }
         }, 100);
         return () => clearInterval(interval);
-    }, [isTransportPlaying, mergedStemUrl, stems]);
+    }, [isTransportPlaying, mergedStemUrl, visibleStemKeys]);
 
     useEffect(() => {
         setMutedStems({});
         setIsTransportPlaying(false);
         setCurrentTime(0);
-    }, [stemUrls, mergedStemUrl]);
+        setMergedStemMembers([]);
+    }, [stemUrls]);
+
+    useEffect(() => {
+        const mergedAudio = audioRefs.current.merged;
+        if (mergedAudio) {
+            mergedAudio.pause();
+            mergedAudio.currentTime = 0;
+        }
+    }, [mergedStemUrl]);
+
+    useEffect(() => {
+        mergedStemMembers.forEach(stemName => {
+            const audio = audioRefs.current[stemName];
+            if (audio) {
+                audio.pause();
+            }
+        });
+    }, [mergedStemMembers]);
+
+    useEffect(() => {
+        const mergedAudio = audioRefs.current.merged;
+        if (!mergedAudio || !mergedStemUrl) return;
+
+        mergedAudio.currentTime = currentTime;
+        mergedAudio.volume = getPlaybackVolume('merged');
+
+        if (isTransportPlaying) {
+            void mergedAudio.play();
+        }
+    }, [mergedStemUrl]);
 
     const handleModelChange = async (model: ModelType) => {
         if (modelLoaded && selectedModel === model) return;
@@ -168,14 +209,6 @@ export function Home() {
         });
     };
 
-    const getTransportStemKeys = () => {
-        const stemKeys = [...stems];
-        if (mergedStemUrl) {
-            stemKeys.push('merged');
-        }
-        return stemKeys;
-    };
-
     const playAll = async () => {
         const transportStemKeys = getTransportStemKeys();
         await Promise.all(transportStemKeys.map(async stem => {
@@ -219,13 +252,14 @@ export function Home() {
     };
 
     const handleDownloadAll = () => {
-        stems.forEach((source, index) => {
-            const url = stemUrls[source];
+        const downloadKeys = getTransportStemKeys();
+        downloadKeys.forEach((source, index) => {
+            const url = source === 'merged' ? mergedStemUrl : stemUrls[source];
             if (url) {
                 setTimeout(() => {
                     const a = document.createElement('a');
                     a.href = url;
-                    a.download = `${source}.wav`;
+                    a.download = source === 'merged' ? 'merged.wav' : `${source}.wav`;
                     a.click();
                 }, index * 200);
             }
@@ -244,12 +278,13 @@ export function Home() {
     const handleMergeStems = async () => {
         if (selectedStems.size === 0) return;
         setIsMerging(true);
+        const audioContext = new AudioContext({ sampleRate: 44100 });
+        const mergeMembers = Array.from(selectedStems);
 
         try {
-            const audioContext = new AudioContext({ sampleRate: 44100 });
             const decodedBuffers: AudioBuffer[] = [];
             
-            for (const stemKey of selectedStems) {
+            for (const stemKey of mergeMembers) {
                 const url = stemUrls[stemKey];
                 if (url) {
                     const response = await fetch(url);
@@ -280,16 +315,22 @@ export function Home() {
             const blob = createWavBlob(mergedData, 2, 44100);
             const url = URL.createObjectURL(blob);
 
+            const mergedAudio = audioRefs.current.merged;
+            if (mergedAudio) {
+                mergedAudio.pause();
+                mergedAudio.currentTime = 0;
+            }
             if (mergedStemUrl) URL.revokeObjectURL(mergedStemUrl);
             setMergedStemUrl(url);
+            setMergedStemMembers(mergeMembers);
             setMergeMode(false);
             setSelectedStems(new Set());
-            audioContext.close();
         } catch (error) {
             console.error('Error merging:', error);
+        } finally {
+            void audioContext.close();
+            setIsMerging(false);
         }
-
-        setIsMerging(false);
     };
 
     // Get display name for plaque - prefer metadata title over filename
@@ -441,7 +482,7 @@ export function Home() {
                             {/* Mixer */}
                             <div className="mixer-console">
                                 <div className="mixer-channels justify-center">
-                                    {stems.map(stemKey => {
+                                    {visibleStemKeys.map(stemKey => {
                                         const style = STEM_STYLES[stemKey] || STEM_STYLES.other;
                                         return (
                                             <ChannelStrip
