@@ -1,11 +1,7 @@
 # demucs-next
 
 > [!WARNING]
-<<<<<<< HEAD
 > `demucs-next` is still in alpha not recommended for production use.
-=======
-> `demucs-next` is still in development not recommended for production use.
->>>>>>> 6b37e0794b55ee4c1ee155d2f40eaeb2d598e5b7
 
 Demucs is a SOTA music source separation model capable of separating drums, bass, and vocals from the rest of the accompaniment.
 This is a fork of the [author's fork](https://github.com/adefossez/demucs) of the original Demucs repository.
@@ -18,11 +14,7 @@ This is a fork of the [author's fork](https://github.com/adefossez/demucs) of th
 
 Before installing Demucs, make sure your system has:
 
-<<<<<<< HEAD
 - FFmpeg v4+ available in your `PATH`
-=======
-- FFmpeg v4+ installed and available your on `PATH`
->>>>>>> 6b37e0794b55ee4c1ee155d2f40eaeb2d598e5b7
 - [`uv`](https://docs.astral.sh/uv/#installation)
 - Optionally, a working C/C++ compiler such as `g++` if you plan to use `--compile`
 
@@ -46,11 +38,7 @@ uv venv --managed-python --python 3.12
 source .venv/bin/activate
 ```
 
-<<<<<<< HEAD
-Using a `uv`-managed Python is recommended because it will include the Python headers needed by PyTorch / Triton.
-=======
 Using a `uv`-managed Python is recommended because it will include the Python headers needed by PyTorch / Triton, while system Pythons on Linux may still require `python3-dev`.
->>>>>>> 6b37e0794b55ee4c1ee155d2f40eaeb2d598e5b7
 
 Then install Demucs into that environment:
 

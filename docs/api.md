@@ -20,15 +20,9 @@ A `Separator` takes the following parameters:
 
 - `model` - The model to use for separation. While just passing in a string is the easiest, you can use `ModelRepository` to load models manually and then pass them in.
 - `device` - The device/backend to use for loading and running the model. Demucs can usually auto-detect the best backend to use based on the availability of the hardware using the heuristic above.
-<<<<<<< HEAD
-- `only_load` - Optional, if specified, load only the specialized model for this stem (only applicable to ensembles like htdemucs_ft).
-- `dtype` - Optional, set to `torch.float16` for half-precision inference on CUDA. If `None`, uses default float32.
-- `compile` - Optional, if `True`, compiles the core of the HTDemucs neural network on CUDA. This will significantly improve the performance of the model at the cost of a significant warmup cost. 
-=======
 - `only_load` - Optional, if specified, load only the specialized model for this stem (only applicable to bag-of-models like htdemucs_ft).
 - `dtype` - Optional, set to `torch.float16` for half-precision inference on CUDA. If `None`, uses default float32.
 - `compile` - Optional, if `True`, compiles only the `HTDemucs.forward_core()` neural network body on CUDA. This avoids the complex STFT/iSTFT path and improves steady-state throughput for long-lived jobs. Use `Separator.warmup(batch_sizes=[...])` to precompile the batch sizes you expect to serve. Default is `False`.
->>>>>>> 6b37e0794b55ee4c1ee155d2f40eaeb2d598e5b7
 
 ### Attributes
 
@@ -39,11 +33,7 @@ After construction, the following attributes are available on a `Separator` inst
 - `audio_channels` - Number of audio channels the model expects (`int`).
 - `sample_rate` - Sample rate the model operates at (`int`).
 
-<<<<<<< HEAD
-If you enable compilation, you can optionally pre-warm the compiled path for the batch sizes you expect to run using the `warmup` method:
-=======
 If you enable compilation, you can optionally pre-warm the compiled path for the batch sizes you expect to run:
->>>>>>> 6b37e0794b55ee4c1ee155d2f40eaeb2d598e5b7
 
 ```python
 separator.warmup(batch_sizes=[4, 1])
