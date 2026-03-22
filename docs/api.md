@@ -49,6 +49,7 @@ def separate(
     split: bool = True,
     split_size: int | None = None,
     split_overlap: float = 0.25,
+    seed: int | None = None,
     progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
     use_only_stem: str | None = None,
     chunk_batch_size: int | None = None,
@@ -62,9 +63,23 @@ When separating audio, you have the ability to specify the following parameters:
 - `split` - Whether to split the audio into chunks.
 - `split_size` - The size of each chunk in seconds.
 - `split_overlap` - The overlap between split chunks. Must be in the range `[0.0, 1.0)`.
+- `seed` - Optional random seed for reproducible shift-based inference. This is especially useful when benchmarking configurations that use `shifts > 1`.
 - `progress_callback` - A callback function to receive progress updates. View the [Progress Callbacks](#progress-callbacks) section for more information.
 - `use_only_stem` - If specified, perform the separation using only the specialized model for this stem. In most cases you should use `only_load` when creating the `Separator` instance instead of this.
 - `chunk_batch_size` - Number of split chunks to process in parallel. Defaults to `4` on CUDA and `1` on CPU/MPS.
+
+Example:
+
+```python
+sources = separator.separate(
+    "mixture.wav",
+    shifts=4,
+    split=True,
+    split_size=20,
+    split_overlap=0.25,
+    seed=1234,
+)
+```
 
 ## SeparatedSources
 

@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import random
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
@@ -383,6 +384,7 @@ class Separator:
         split: bool = True,
         split_size: int | None = None,
         split_overlap: float = 0.25,
+        seed: int | None = None,
         progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
         use_only_stem: str | None = None,
         chunk_batch_size: int | None = None,
@@ -400,6 +402,7 @@ class Separator:
                              Higher values improve quality at chunk boundaries
         :param split: Whether to split the input into chunks for processing
         :param split_size: Length (in seconds) of each chunk (only used if split=True)
+        :param seed: Optional random seed for reproducible shift-based inference
         :param progress_callback: Optional callback for progress updates during audio processing
         :param use_only_stem: If specified and model is a ModelEnsemble, only use the model
                              specialized for this stem (performance optimization for Cog)
@@ -413,6 +416,11 @@ class Separator:
         if not isinstance(shifts, int) or shifts < 1 or shifts > 20:
             raise ValidationError(
                 f"shifts must be an integer between 1 and 20 (inclusive), got {shifts}"
+            )
+
+        if seed is not None and not isinstance(seed, int):
+            raise ValidationError(
+                f"seed must be an integer if provided, got {type(seed)}"
             )
 
         # Validate split_overlap parameter
@@ -454,6 +462,12 @@ class Separator:
         # Normalize input to tensor
         wav = self._to_tensor(audio)
         original = wav.clone()
+
+        if seed is not None:
+            random.seed(seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
 
         # Separation logic (inlined)
         ref = wav.mean(0)

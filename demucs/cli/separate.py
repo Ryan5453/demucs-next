@@ -88,6 +88,13 @@ def separate_command(
             rich_help_panel="Processing",
         ),
     ] = 0.25,
+    seed: Annotated[
+        int | None,
+        typer.Option(
+            help="Random seed for reproducible shift-based inference",
+            rich_help_panel="Processing",
+        ),
+    ] = None,
     compile: Annotated[
         bool,
         typer.Option(
@@ -215,6 +222,7 @@ def separate_command(
                     split=split,
                     split_size=split_size,
                     split_overlap=split_overlap,
+                    seed=seed,
                     progress_callback=audio_callback,
                 )
 
