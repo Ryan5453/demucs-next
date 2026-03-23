@@ -88,6 +88,10 @@ def _compute_sdr(estimate: torch.Tensor, reference: torch.Tensor) -> float:
     return 10.0 * math.log10(reference_energy / noise_energy)
 
 
+def _is_unsupported_full_track_error(error: Exception) -> bool:
+    return "longer than training length" in str(error).lower()
+
+
 def _discover_tracks(musdb_root: Path) -> list[BenchmarkTrack]:
     if not musdb_root.is_dir():
         raise typer.BadParameter(f"MUSDB root does not exist: {musdb_root}")
@@ -316,6 +320,10 @@ def main(
         successful_track_rows: list[dict[str, Any]] = []
         error_count = 0
         oom_count = 0
+        unsupported_length_count = 0
+        unsupported_config = False
+        config_error_type = ""
+        config_error_message = ""
 
         for track_index, track in enumerate(tracks, start=1):
             detail_row = {
@@ -367,9 +375,15 @@ def main(
                 is_oom = isinstance(error, torch.OutOfMemoryError) or (
                     "out of memory" in str(error).lower()
                 )
+                is_unsupported_length = (
+                    not config.split and _is_unsupported_full_track_error(error)
+                )
 
                 detail_row["elapsed_sec"] = elapsed_sec
-                detail_row["status"] = "oom" if is_oom else "error"
+                if is_unsupported_length:
+                    detail_row["status"] = "unsupported_length"
+                else:
+                    detail_row["status"] = "oom" if is_oom else "error"
                 detail_row["error_type"] = error_type
                 detail_row["error_message"] = str(error)
                 detail_row["num_scored_stems"] = 0
@@ -380,6 +394,11 @@ def main(
                 details_rows.append(detail_row)
                 if is_oom:
                     oom_count += 1
+                elif is_unsupported_length:
+                    unsupported_length_count += 1
+                    unsupported_config = True
+                    config_error_type = error_type
+                    config_error_message = str(error)
                 else:
                     error_count += 1
 
@@ -389,6 +408,33 @@ def main(
                 )
                 traceback.print_exc()
                 torch.cuda.empty_cache()
+
+                if unsupported_config:
+                    for skipped_track_index, skipped_track in enumerate(
+                        tracks[track_index:],
+                        start=track_index + 1,
+                    ):
+                        details_rows.append(
+                            {
+                                **_detail_row_base(config, chunk_batch_size, seed),
+                                "track_index": skipped_track_index,
+                                "track_name": skipped_track.name,
+                                "track_seed": None
+                                if seed is None
+                                else _build_track_seed(seed, skipped_track.name),
+                                "status": "skipped_unsupported_length",
+                                "error_type": error_type,
+                                "error_message": str(error),
+                                "elapsed_sec": None,
+                                "num_scored_stems": 0,
+                                "mean_sdr": float("nan"),
+                                **{
+                                    f"{stem_name}_sdr": None
+                                    for stem_name in REFERENCE_STEMS
+                                },
+                            }
+                        )
+                    break
 
             peak_vram_bytes = max(
                 peak_vram_bytes,
@@ -423,13 +469,18 @@ def main(
         summary_rows.append(
             {
                 **_summary_row_base(config, chunk_batch_size, seed),
-                "status": "ok" if len(ok_rows) == len(tracks) else "partial",
-                "error_type": "",
-                "error_message": "",
+                "status": (
+                    "unsupported_length"
+                    if unsupported_config
+                    else "ok" if len(ok_rows) == len(tracks) else "partial"
+                ),
+                "error_type": config_error_type,
+                "error_message": config_error_message,
                 "num_tracks": len(tracks),
                 "ok_tracks": len(ok_rows),
                 "error_tracks": error_count,
                 "oom_tracks": oom_count,
+                "unsupported_length_tracks": unsupported_length_count,
                 "model_init_sec": model_init_sec,
                 "first_attempt_sec": (
                     float(config_detail_rows[0]["elapsed_sec"]) if config_detail_rows else None
@@ -519,6 +570,7 @@ def main(
         "ok_tracks",
         "error_tracks",
         "oom_tracks",
+        "unsupported_length_tracks",
         "model_init_sec",
         "first_attempt_sec",
         "first_attempt_status",
