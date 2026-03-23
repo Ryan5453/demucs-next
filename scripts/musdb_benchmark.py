@@ -447,7 +447,11 @@ def main(
         ok_rows = [row for row in successful_track_rows if row["status"] == "ok"]
         ok_elapsed = [float(row["elapsed_sec"]) for row in ok_rows]
         remaining_elapsed = ok_elapsed[1:]
-        attempted_elapsed = [float(row["elapsed_sec"]) for row in config_detail_rows]
+        attempted_elapsed = [
+            float(row["elapsed_sec"])
+            for row in config_detail_rows
+            if row.get("elapsed_sec") is not None
+        ]
         mean_sdr_values = [
             float(row["mean_sdr"])
             for row in ok_rows
