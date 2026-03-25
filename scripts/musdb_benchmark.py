@@ -122,18 +122,26 @@ def _discover_tracks(musdb_root: Path) -> list[BenchmarkTrack]:
     return tracks
 
 
-def _build_configs() -> list[BenchmarkConfig]:
+def _build_configs(
+    models: list[str],
+    precisions: list[str],
+    compile_modes: list[bool],
+    split_modes: list[bool],
+    shifts_values: list[int],
+    split_sizes: list[int],
+    split_overlaps: list[float],
+) -> list[BenchmarkConfig]:
     configs: list[BenchmarkConfig] = []
     config_index = 1
 
-    for model in DEFAULT_MODELS:
-        for precision in DEFAULT_PRECISIONS:
-            for compile_mode in DEFAULT_COMPILE_MODES:
-                for split_mode in DEFAULT_SPLIT_MODES:
-                    for shifts in DEFAULT_SHIFTS:
+    for model in models:
+        for precision in precisions:
+            for compile_mode in compile_modes:
+                for split_mode in split_modes:
+                    for shifts in shifts_values:
                         if split_mode:
-                            for split_size in DEFAULT_SPLIT_SIZES:
-                                for split_overlap in DEFAULT_SPLIT_OVERLAPS:
+                            for split_size in split_sizes:
+                                for split_overlap in split_overlaps:
                                     configs.append(
                                         BenchmarkConfig(
                                             config_id=f"cfg_{config_index:04d}",
@@ -241,6 +249,43 @@ def main(
         min=1,
         help="Override how many split chunks are processed per batch",
     ),
+    models: list[str] = typer.Option(
+        DEFAULT_MODELS,
+        "--model",
+        help="Model(s) to benchmark. Repeat to benchmark multiple models.",
+    ),
+    precisions: list[str] = typer.Option(
+        DEFAULT_PRECISIONS,
+        "--precision",
+        help="Precision mode(s) to benchmark. Repeat to benchmark multiple values.",
+    ),
+    compile_modes: list[bool] = typer.Option(
+        DEFAULT_COMPILE_MODES,
+        "--compile-mode",
+        help="Compilation mode(s) to benchmark. Repeat for false/true.",
+    ),
+    split_modes: list[bool] = typer.Option(
+        DEFAULT_SPLIT_MODES,
+        "--split-mode",
+        help="Split mode(s) to benchmark. Repeat for false/true.",
+    ),
+    shifts_values: list[int] = typer.Option(
+        DEFAULT_SHIFTS,
+        "--shifts",
+        min=1,
+        help="Shift counts to benchmark. Repeat to benchmark multiple values.",
+    ),
+    split_sizes: list[int] = typer.Option(
+        DEFAULT_SPLIT_SIZES,
+        "--split-size",
+        min=1,
+        help="Split sizes in seconds to benchmark. Repeat to benchmark multiple values.",
+    ),
+    split_overlaps: list[float] = typer.Option(
+        DEFAULT_SPLIT_OVERLAPS,
+        "--split-overlap",
+        help="Split overlaps to benchmark. Repeat to benchmark multiple values.",
+    ),
 ) -> None:
     """
     Benchmark the built-in MUSDB CUDA matrix and record SDR plus timing.
@@ -252,7 +297,15 @@ def main(
     if limit is not None:
         tracks = tracks[:limit]
 
-    configs = _build_configs()
+    configs = _build_configs(
+        models=models,
+        precisions=precisions,
+        compile_modes=compile_modes,
+        split_modes=split_modes,
+        shifts_values=shifts_values,
+        split_sizes=split_sizes,
+        split_overlaps=split_overlaps,
+    )
 
     if output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -604,13 +657,13 @@ def main(
         "musdb_root": str(musdb_root),
         "output_dir": str(output_dir),
         "device": "cuda",
-        "models": DEFAULT_MODELS,
-        "precisions": DEFAULT_PRECISIONS,
-        "compile_modes": DEFAULT_COMPILE_MODES,
-        "split_modes": DEFAULT_SPLIT_MODES,
-        "shifts": DEFAULT_SHIFTS,
-        "split_sizes": DEFAULT_SPLIT_SIZES,
-        "split_overlaps": DEFAULT_SPLIT_OVERLAPS,
+        "models": models,
+        "precisions": precisions,
+        "compile_modes": compile_modes,
+        "split_modes": split_modes,
+        "shifts": shifts_values,
+        "split_sizes": split_sizes,
+        "split_overlaps": split_overlaps,
         "seed": seed,
         "limit": limit,
         "num_tracks": len(tracks),

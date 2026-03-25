@@ -11,10 +11,6 @@
     "htdemucs_ft": {
       "models": [
         {
-          "remote": "hybrid_transformer/955717e8-8726e21a.th",
-          "checksum": "8726e21a"
-        },
-        {
           "remote": "hybrid_transformer/f7e0c4bc-ba3fe64a.th",
           "checksum": "ba3fe64a"
         },
@@ -25,6 +21,10 @@
         {
           "remote": "hybrid_transformer/92cfc3b6-ef3bcb9c.th",
           "checksum": "ef3bcb9c"
+        },
+        {
+          "remote": "hybrid_transformer/04573f0d-f3cf25b2.th",
+          "checksum": "f3cf25b2"
         }
       ],
       "weights": [
