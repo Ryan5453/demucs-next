@@ -34,13 +34,7 @@ def export_onnx_command(
             help="ONNX opset version",
         ),
     ] = 17,
-    segment: Annotated[
-        float,
-        typer.Option(
-            help="Segment length in seconds",
-        ),
-    ] = 10.0,
-):
+) -> None:
     """
     Export a HTDemucs model to the ONNX format.
 
@@ -53,7 +47,6 @@ def export_onnx_command(
             model_name=model,
             output_path=output_path,
             opset_version=opset,
-            segment_seconds=segment,
         )
     except ValueError as e:
         console.print(f"[red]Error:[/red] {e}")

@@ -29,7 +29,10 @@ export interface STFTResult {
 export const SAMPLE_RATE = 44100;
 export const NFFT = 4096;
 export const HOP_LENGTH = NFFT / 4;
-export const SEGMENT_SECONDS = 10;
-export const SEGMENT_SAMPLES = SEGMENT_SECONDS * SAMPLE_RATE;
+// HTDemucs training length (7.8s); ONNX is traced at this exact size, so
+// callers must feed it.
+export const SEGMENT_SAMPLES = 343980;
+export const SEGMENT_SECONDS = SEGMENT_SAMPLES / SAMPLE_RATE;
+export const SEGMENT_OVERLAP = 0.25;
 
 export type ModelType = 'htdemucs' | 'htdemucs_6s';

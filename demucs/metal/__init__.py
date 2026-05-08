@@ -1,0 +1,1233 @@
+"""Custom Metal kernels for FP16 inference on Apple Silicon (MPS).
+
+PyTorch's MPS backend in 2.11 has slow paths for several FP16 ops that are
+hot in HTDemucs — most notably ``aten::native_group_norm`` (3.5x slower in
+FP16 than FP32) and ``aten::scaled_dot_product_attention`` (~50% slower in
+FP16 due to implicit upcasts at op boundaries). This module ships drop-in
+replacements that close those gaps:
+
+- :class:`MetalGroupNorm` and :class:`MetalMyGroupNorm` — wrap PyTorch's
+  ``nn.GroupNorm`` and the transformer's ``MyGroupNorm`` with a single
+  fused Metal kernel for FP16 inputs (with an FP32-cast fallback for the
+  small-batch / large-per-batch shapes where the GPU stays under-utilised).
+- :class:`MetalMultiheadAttention` — keeps Q/K/V/output linear projections
+  in FP16 (PyTorch's MPS matmul has a fast FP16 path) and casts only for
+  the SDPA call itself, where MPS's FP32 path is faster than its FP16 path.
+
+These are activated automatically by :func:`apply_metal_optimizations`,
+which :class:`demucs.api.Separator` calls when the user opts into FP16
+on MPS. They are no-ops on CPU/CUDA — those paths use PyTorch's native
+ops.
+"""
+
+from __future__ import annotations
+
+from importlib import resources
+from typing import Any
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ---------------------------------------------------------------------------
+# Metal kernel sources
+# ---------------------------------------------------------------------------
+#
+# The Metal Shading Language sources live in sibling ``.metal`` files,
+# split by purpose:
+#
+#   group_norm.metal       — basic GroupNorm + reduction primitives
+#                            (``partial_reduce_fp16`` + ``finalize_meanvar``,
+#                            shared by every multi-stage path below)
+#   group_norm_gelu.metal  — GroupNorm fused with GELU
+#   group_norm_glu.metal   — GroupNorm fused with GLU (channel halving)
+#   dconv_envelope.metal   — DConv post-conv2 envelope
+#                            (residual + layer_scale * glu(group_norm(z)))
+#
+# All reductions accumulate in FP32 inside the kernel; FP16 only crosses
+# the device-memory boundary at load and store. This avoids the implicit
+# cast traffic that makes PyTorch's stock FP16 GroupNorm slow on MPS.
+def _load_metal_source(name: str) -> str:
+    """Read a Metal source file shipped alongside this package."""
+    return resources.files(__name__).joinpath(name).read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Lazy kernel compilation
+# ---------------------------------------------------------------------------
+#
+# The kernels are split across four ``.metal`` files by purpose. Each file
+# compiles to its own Metal library; kernels in different libraries
+# communicate only through global memory buffers (e.g. the ``meanvar``
+# scratch the multi-stage paths share between ``finalize_meanvar`` from
+# ``group_norm.metal`` and the ``apply_*`` kernels in the activation /
+# envelope files).
+
+_KERNEL_SOURCES: dict[str, str] = {
+    # group_norm.metal — basic GroupNorm + reduction primitives
+    "group_norm_g1_fp16":         "group_norm.metal",
+    "partial_reduce_fp16":        "group_norm.metal",
+    "finalize_meanvar":           "group_norm.metal",
+    "apply_norm_fp16":            "group_norm.metal",
+    # group_norm_gelu.metal — GN fused with GELU
+    "group_norm_g1_gelu_fp16":    "group_norm_gelu.metal",
+    "apply_norm_gelu_fp16":       "group_norm_gelu.metal",
+    # group_norm_glu.metal — GN fused with GLU (channel halving)
+    "group_norm_g1_glu_fp16":     "group_norm_glu.metal",
+    "apply_norm_glu_fp16":        "group_norm_glu.metal",
+    # dconv_envelope.metal — DConv post-conv2 fusion paths
+    "glu_layerscale_resid_fp16":      "dconv_envelope.metal",
+    "norm_glu_ls_resid_fp16":         "dconv_envelope.metal",
+    "apply_norm_glu_ls_resid_fp16":   "dconv_envelope.metal",
+}
+
+
+_compiled_libraries: dict[str, Any] = {}
+_compiled_kernels: dict[str, Any] = {}
+
+
+def _get_kernel(name: str) -> Any:
+    """Look up a Metal kernel by name; compile its source file once and
+    cache both the library and the per-kernel handle.
+
+    PyTorch's ``torch.mps.compile_shader`` does not deduplicate identical
+    sources internally, so we cache the compiled library by filename.
+    """
+    cached = _compiled_kernels.get(name)
+    if cached is not None:
+        return cached
+    if not hasattr(torch.mps, "compile_shader"):
+        raise RuntimeError(
+            "torch.mps.compile_shader unavailable; need PyTorch >= 2.6 for "
+            "Metal kernel-backed FP16 inference."
+        )
+    source_file = _KERNEL_SOURCES.get(name)
+    if source_file is None:
+        raise KeyError(
+            f"Unknown Metal kernel {name!r}; expected one of "
+            f"{sorted(_KERNEL_SOURCES)}"
+        )
+    lib = _compiled_libraries.get(source_file)
+    if lib is None:
+        lib = torch.mps.compile_shader(_load_metal_source(source_file))
+        _compiled_libraries[source_file] = lib
+    fn = getattr(lib, name)
+    _compiled_kernels[name] = fn
+    return fn
+
+
+# ---------------------------------------------------------------------------
+# Module replacements
+# ---------------------------------------------------------------------------
+
+
+class MetalGroupNorm(nn.Module):
+    """Replacement for ``nn.GroupNorm(num_groups=1)`` on MPS+FP16.
+
+    Two FP16 fast paths and one FP32 fallback:
+
+    - **Single-stage** (``per_batch <= 1.5M``): one threadgroup per batch
+      element. Fully fused; lowest launch overhead. Best for the high-B,
+      low-per-batch shapes that dominate count in HTDemucs (DConv internals).
+    - **Multi-stage** (``per_batch > 1.5M``): three Metal kernels —
+      partial-reduce per tile, finalise mean/scale per batch, apply per
+      tile. Tiles parallelise across many threadgroups so the GPU is
+      saturated even when ``B == 2``. Used for the outermost
+      encoder/decoder GroupNorms.
+    - **PyTorch fallback** (``F.group_norm``): non-MPS devices and FP32
+      inputs.
+    """
+
+    # Per-batch element count above which the single-stage kernel only fires
+    # ``B`` threadgroups and leaves most of the GPU idle. Above this we
+    # switch to the multi-stage path.
+    _SINGLE_STAGE_LIMIT = 1_500_000
+    # Target tile size for the multi-stage path. Each stage-1/3 threadgroup
+    # processes ``~TILE_SIZE`` elements; we pick ``num_tiles`` so each tile
+    # is roughly this size, capped to avoid excessive scratch.
+    _MULTI_STAGE_TILE_SIZE = 16_384
+    _MULTI_STAGE_MAX_TILES = 4096
+
+    def __init__(self, gn: nn.GroupNorm) -> None:
+        super().__init__()
+        if gn.num_groups != 1:
+            raise ValueError(
+                f"MetalGroupNorm only supports num_groups=1; got {gn.num_groups}"
+            )
+        if not gn.affine:
+            raise ValueError("MetalGroupNorm requires affine=True")
+        self.num_channels = gn.num_channels
+        self.eps = gn.eps
+        # Affine parameters live in FP32 storage; we cast lazily and cache.
+        self.weight = nn.Parameter(gn.weight.detach().to(torch.float32).clone())
+        self.bias = nn.Parameter(gn.bias.detach().to(torch.float32).clone())
+
+    @classmethod
+    def from_groupnorm(cls, gn: nn.GroupNorm) -> "MetalGroupNorm":
+        return cls(gn)
+
+    def _fp16_affine(
+        self, dtype: torch.dtype, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cache = getattr(self, "_aff_cache", None)
+        if cache is None:
+            cache = {}
+            object.__setattr__(self, "_aff_cache", cache)
+        key = (dtype, device)
+        cached = cache.get(key)
+        if cached is None:
+            w = self.weight.detach().to(device=device, dtype=dtype).contiguous()
+            b = self.bias.detach().to(device=device, dtype=dtype).contiguous()
+            cache[key] = (w, b)
+            return w, b
+        return cached
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # FP32 / non-MPS: defer to PyTorch's native group_norm.
+        if x.dtype == torch.float32 or x.device.type != "mps":
+            return F.group_norm(x, 1, self.weight, self.bias, self.eps)
+
+        if x.dtype != torch.float16:
+            # Other low-precision dtypes (e.g. bfloat16) — let PyTorch handle.
+            return F.group_norm(
+                x.to(torch.float32), 1, self.weight, self.bias, self.eps
+            ).to(x.dtype)
+
+        x_contig = x.contiguous()
+        B = x_contig.shape[0]
+        C = x_contig.shape[1]
+        N = 1
+        for d in x_contig.shape[2:]:
+            N *= d
+        per_batch = C * N
+
+        weight, bias = self._fp16_affine(x.dtype, x.device)
+
+        if per_batch <= self._SINGLE_STAGE_LIMIT:
+            kernel = _get_kernel("group_norm_g1_fp16")
+            max_tgs = min(kernel.max_threads_per_threadgroup, 1024)
+            tgs = 256
+            while tgs > max_tgs:
+                tgs //= 2
+            while tgs > 1 and tgs > per_batch:
+                tgs //= 2
+            out = torch.empty_like(x_contig)
+            kernel(
+                out,
+                x_contig,
+                weight,
+                bias,
+                C,
+                N,
+                float(self.eps),
+                threads=B * tgs,
+                group_size=tgs,
+            )
+            return out.view_as(x)
+
+        # Multi-stage path. Tile the per-batch work so that ``B * num_tiles``
+        # threadgroups participate in stage 1 and 3 — that's enough to keep
+        # the Apple GPU fully busy even when ``B == 2``.
+        num_tiles = min(
+            self._MULTI_STAGE_MAX_TILES,
+            max(1, (per_batch + self._MULTI_STAGE_TILE_SIZE - 1) // self._MULTI_STAGE_TILE_SIZE),
+        )
+        # Keep num_tiles a power of two for the stage-2 reduction (kernel
+        # tree-reduces over its threads, which is cleanest with pow-2 tgs).
+        # We snap *down* — overshooting MAX_TILES would also work, but
+        # snapping down keeps each tile a touch larger which is fine.
+        pow2 = 1
+        while pow2 * 2 <= num_tiles:
+            pow2 *= 2
+        num_tiles = pow2
+
+        scratch = torch.empty(
+            (B, num_tiles, 2), dtype=torch.float32, device=x.device
+        )
+        meanvar = torch.empty((B, 2), dtype=torch.float32, device=x.device)
+        out = torch.empty_like(x_contig)
+
+        k1 = _get_kernel("partial_reduce_fp16")
+        k2 = _get_kernel("finalize_meanvar")
+        k3 = _get_kernel("apply_norm_fp16")
+
+        tgs1 = 256
+        while tgs1 > k1.max_threads_per_threadgroup:
+            tgs1 //= 2
+
+        # Stage 2 reduces ``num_tiles`` floats per batch; size threadgroup to
+        # at most ``num_tiles`` (still power-of-2 for the tree reduction).
+        tgs2 = min(num_tiles, k2.max_threads_per_threadgroup)
+        pow2 = 1
+        while pow2 * 2 <= tgs2:
+            pow2 *= 2
+        tgs2 = pow2
+
+        tgs3 = 256
+        while tgs3 > k3.max_threads_per_threadgroup:
+            tgs3 //= 2
+
+        k1(
+            x_contig,
+            scratch,
+            per_batch,
+            num_tiles,
+            threads=B * num_tiles * tgs1,
+            group_size=tgs1,
+        )
+        k2(
+            scratch,
+            meanvar,
+            per_batch,
+            num_tiles,
+            float(self.eps),
+            threads=B * tgs2,
+            group_size=tgs2,
+        )
+        k3(
+            out,
+            x_contig,
+            meanvar,
+            weight,
+            bias,
+            per_batch,
+            num_tiles,
+            N,
+            threads=B * num_tiles * tgs3,
+            group_size=tgs3,
+        )
+        return out.view_as(x)
+
+
+class FusedGroupNormGelu(MetalGroupNorm):
+    """Drop-in for the ``gelu(group_norm(...))`` pattern.
+
+    Same shape contract as ``nn.GroupNorm`` (input == output shape) but the
+    forward applies the tanh-approximated GELU at the same time as the
+    normalize+affine, saving a memory round-trip on the activation tensor.
+
+    Activated automatically via :func:`apply_metal_optimizations` for the
+    ``self.norm1`` slots in HEncLayer/HDecLayer/DConv where a GELU follows.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # FP32 / non-MPS: hand to PyTorch.
+        if x.dtype == torch.float32 or x.device.type != "mps":
+            return F.gelu(
+                F.group_norm(x, 1, self.weight, self.bias, self.eps),
+                approximate="tanh",
+            )
+        if x.dtype != torch.float16:
+            return F.gelu(
+                F.group_norm(
+                    x.to(torch.float32), 1, self.weight, self.bias, self.eps
+                ),
+                approximate="tanh",
+            ).to(x.dtype)
+
+        x_contig = x.contiguous()
+        B = x_contig.shape[0]
+        C = x_contig.shape[1]
+        N = 1
+        for d in x_contig.shape[2:]:
+            N *= d
+        per_batch = C * N
+        weight, bias = self._fp16_affine(x.dtype, x.device)
+
+        if per_batch <= self._SINGLE_STAGE_LIMIT:
+            kernel = _get_kernel("group_norm_g1_gelu_fp16")
+            tgs = min(256, kernel.max_threads_per_threadgroup)
+            while tgs > 1 and tgs > per_batch:
+                tgs //= 2
+            out = torch.empty_like(x_contig)
+            kernel(
+                out, x_contig, weight, bias,
+                C, N, float(self.eps),
+                threads=B * tgs, group_size=tgs,
+            )
+            return out.view_as(x)
+
+        # Multi-stage: reuse partial_reduce / finalize, then apply_norm_gelu.
+        num_tiles = min(
+            self._MULTI_STAGE_MAX_TILES,
+            max(1, (per_batch + self._MULTI_STAGE_TILE_SIZE - 1) // self._MULTI_STAGE_TILE_SIZE),
+        )
+        pow2 = 1
+        while pow2 * 2 <= num_tiles:
+            pow2 *= 2
+        num_tiles = pow2
+
+        scratch = torch.empty((B, num_tiles, 2), dtype=torch.float32, device=x.device)
+        meanvar = torch.empty((B, 2), dtype=torch.float32, device=x.device)
+        out = torch.empty_like(x_contig)
+
+        k1 = _get_kernel("partial_reduce_fp16")
+        k2 = _get_kernel("finalize_meanvar")
+        k3 = _get_kernel("apply_norm_gelu_fp16")
+
+        tgs1 = min(256, k1.max_threads_per_threadgroup)
+        tgs2 = min(num_tiles, k2.max_threads_per_threadgroup)
+        pow2 = 1
+        while pow2 * 2 <= tgs2:
+            pow2 *= 2
+        tgs2 = pow2
+        tgs3 = min(256, k3.max_threads_per_threadgroup)
+
+        k1(x_contig, scratch, per_batch, num_tiles,
+           threads=B * num_tiles * tgs1, group_size=tgs1)
+        k2(scratch, meanvar, per_batch, num_tiles, float(self.eps),
+           threads=B * tgs2, group_size=tgs2)
+        k3(out, x_contig, meanvar, weight, bias,
+           per_batch, num_tiles, N,
+           threads=B * num_tiles * tgs3, group_size=tgs3)
+        return out.view_as(x)
+
+
+class FusedGroupNormGlu(MetalGroupNorm):
+    """Drop-in for the ``glu(group_norm(rewrite(...)), dim=1)`` pattern.
+
+    Input shape: ``(B, 2C, ...)``. Output shape: ``(B, C, ...)``. The
+    GroupNorm reduces over all 2C input channels (so the per-batch mean
+    matches ``F.group_norm`` exactly), then for each output channel pair
+    we read ``a = norm(in[c])`` and ``b = norm(in[c + C])`` and combine
+    via ``a * sigmoid(b)`` — all without ever writing the post-norm
+    full-size tensor to memory.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dtype == torch.float32 or x.device.type != "mps":
+            return F.glu(
+                F.group_norm(x, 1, self.weight, self.bias, self.eps), dim=1,
+            )
+        if x.dtype != torch.float16:
+            return F.glu(
+                F.group_norm(
+                    x.to(torch.float32), 1, self.weight, self.bias, self.eps
+                ),
+                dim=1,
+            ).to(x.dtype)
+
+        x_contig = x.contiguous()
+        B = x_contig.shape[0]
+        C_in = x_contig.shape[1]
+        if C_in % 2 != 0:
+            raise ValueError(
+                f"FusedGroupNormGlu requires even input channels; got {C_in}"
+            )
+        C_half = C_in // 2
+        N = 1
+        for d in x_contig.shape[2:]:
+            N *= d
+        per_batch_in = C_in * N
+        per_batch_out = C_half * N
+        weight, bias = self._fp16_affine(x.dtype, x.device)
+
+        if per_batch_in <= self._SINGLE_STAGE_LIMIT:
+            kernel = _get_kernel("group_norm_g1_glu_fp16")
+            tgs = min(256, kernel.max_threads_per_threadgroup)
+            while tgs > 1 and tgs > per_batch_out:
+                tgs //= 2
+            out_shape = (B, C_half) + tuple(x_contig.shape[2:])
+            out = torch.empty(out_shape, dtype=torch.float16, device=x.device)
+            kernel(
+                out, x_contig, weight, bias,
+                C_in, N, float(self.eps),
+                threads=B * tgs, group_size=tgs,
+            )
+            return out
+
+        # Multi-stage: partial-reduce/finalize over the FULL input
+        # (per_batch_in elements per batch), then apply_norm_glu over the
+        # OUTPUT space (per_batch_out elements per batch).
+        num_tiles = min(
+            self._MULTI_STAGE_MAX_TILES,
+            max(1, (per_batch_out + self._MULTI_STAGE_TILE_SIZE - 1) // self._MULTI_STAGE_TILE_SIZE),
+        )
+        pow2 = 1
+        while pow2 * 2 <= num_tiles:
+            pow2 *= 2
+        num_tiles = pow2
+
+        scratch = torch.empty((B, num_tiles, 2), dtype=torch.float32, device=x.device)
+        meanvar = torch.empty((B, 2), dtype=torch.float32, device=x.device)
+        out_shape = (B, C_half) + tuple(x_contig.shape[2:])
+        out = torch.empty(out_shape, dtype=torch.float16, device=x.device)
+
+        k1 = _get_kernel("partial_reduce_fp16")
+        k2 = _get_kernel("finalize_meanvar")
+        k3 = _get_kernel("apply_norm_glu_fp16")
+
+        tgs1 = min(256, k1.max_threads_per_threadgroup)
+        tgs2 = min(num_tiles, k2.max_threads_per_threadgroup)
+        pow2 = 1
+        while pow2 * 2 <= tgs2:
+            pow2 *= 2
+        tgs2 = pow2
+        tgs3 = min(256, k3.max_threads_per_threadgroup)
+
+        # Stage 1 reduces over full input (per_batch_in tiled into num_tiles).
+        k1(x_contig, scratch, per_batch_in, num_tiles,
+           threads=B * num_tiles * tgs1, group_size=tgs1)
+        k2(scratch, meanvar, per_batch_in, num_tiles, float(self.eps),
+           threads=B * tgs2, group_size=tgs2)
+        # Stage 3 tiles the OUTPUT (per_batch_out elements) and writes
+        # halve-channel output.
+        k3(out, x_contig, meanvar, weight, bias,
+           per_batch_in, per_batch_out, num_tiles, N, C_half,
+           threads=B * num_tiles * tgs3, group_size=tgs3)
+        return out
+
+
+class FusedGluLayerScaleResidual(nn.Module):
+    """Fused ``residual + layer_scale * glu(z, dim=1)`` for DConv envelope.
+
+    Replaces three eltwise ops (``glu``, per-channel multiply, residual add)
+    with one Metal kernel — saves two activation round-trips. The
+    ``layer_scale`` parameter has shape ``(C,)``.
+    """
+
+    def __init__(self, layer_scale: torch.Tensor) -> None:
+        super().__init__()
+        # Stored in FP32; cast to FP16 lazily and cache.
+        self.layer_scale = nn.Parameter(layer_scale.detach().to(torch.float32).clone())
+
+    def _fp16_scale(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        cache = getattr(self, "_ls_cache", None)
+        if cache is None:
+            cache = {}
+            object.__setattr__(self, "_ls_cache", cache)
+        key = (dtype, device)
+        cached = cache.get(key)
+        if cached is None:
+            t = self.layer_scale.detach().to(device=device, dtype=dtype).contiguous()
+            cache[key] = t
+            return t
+        return cached
+
+    def forward(self, z: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        if z.dtype == torch.float32 or z.device.type != "mps" or z.dtype != torch.float16:
+            # Fallback: explicit eltwise ops.
+            return residual + self.layer_scale[:, None] * F.glu(z, dim=1)
+
+        z_c = z.contiguous()
+        r_c = residual.contiguous()
+        B = z_c.shape[0]
+        C2 = z_c.shape[1]
+        if C2 % 2 != 0:
+            raise ValueError("GLU input channel dim must be even")
+        C = C2 // 2
+        N = 1
+        for d in z_c.shape[2:]:
+            N *= d
+        ls = self._fp16_scale(z.dtype, z.device)
+        out_shape = (B, C) + tuple(z_c.shape[2:])
+        out = torch.empty(out_shape, dtype=torch.float16, device=z.device)
+        kernel = _get_kernel("glu_layerscale_resid_fp16")
+        tgs = min(256, kernel.max_threads_per_threadgroup)
+        kernel(out, z_c, r_c, ls, C, N, threads=B * tgs, group_size=tgs)
+        return out
+
+
+class FusedNormGluLayerScaleResid(MetalGroupNorm):
+    """Single fused op for the DConv envelope after the second conv:
+    ``residual + layer_scale * glu(group_norm(z), dim=1)``.
+
+    Replaces FOUR previously-separate ops (group_norm, glu, layerscale mul,
+    residual add) with one Metal kernel — saves three intermediate tensor
+    writes and the matching reads. ``z`` has 2C input channels, output has
+    C channels.
+
+    Inherits ``MetalGroupNorm`` for the affine-cache and dispatch logic;
+    additionally owns the LayerScale parameter.
+    """
+
+    def __init__(
+        self, gn: nn.GroupNorm, layer_scale_param: torch.Tensor
+    ) -> None:
+        super().__init__(gn)
+        self.layer_scale = nn.Parameter(
+            layer_scale_param.detach().to(torch.float32).clone()
+        )
+
+    @classmethod
+    def from_groupnorm_and_scale(
+        cls, gn: nn.GroupNorm, layer_scale_param: torch.Tensor
+    ) -> "FusedNormGluLayerScaleResid":
+        return cls(gn, layer_scale_param)
+
+    def _fp16_layer_scale(
+        self, dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
+        cache = getattr(self, "_ls_cache", None)
+        if cache is None:
+            cache = {}
+            object.__setattr__(self, "_ls_cache", cache)
+        key = (dtype, device)
+        cached = cache.get(key)
+        if cached is None:
+            t = self.layer_scale.detach().to(device=device, dtype=dtype).contiguous()
+            cache[key] = t
+            return t
+        return cached
+
+    def forward(
+        self, z: torch.Tensor, residual: torch.Tensor
+    ) -> torch.Tensor:
+        # FP32 / non-MPS / non-FP16: explicit eltwise.
+        if (
+            z.dtype == torch.float32
+            or z.device.type != "mps"
+            or z.dtype != torch.float16
+        ):
+            zn = F.group_norm(z, 1, self.weight, self.bias, self.eps)
+            return residual + self.layer_scale[:, None] * F.glu(zn, dim=1)
+
+        z_c = z.contiguous()
+        r_c = residual.contiguous()
+        B = z_c.shape[0]
+        C2 = z_c.shape[1]
+        if C2 % 2 != 0:
+            raise ValueError("GLU input channel dim must be even")
+        C = C2 // 2
+        N = 1
+        for d in z_c.shape[2:]:
+            N *= d
+        per_batch_in = C2 * N
+        per_batch_out = C * N
+        weight, bias = self._fp16_affine(z.dtype, z.device)
+        ls = self._fp16_layer_scale(z.dtype, z.device)
+        out_shape = (B, C) + tuple(z_c.shape[2:])
+        out = torch.empty(out_shape, dtype=torch.float16, device=z.device)
+
+        if per_batch_in <= self._SINGLE_STAGE_LIMIT:
+            kernel = _get_kernel("norm_glu_ls_resid_fp16")
+            tgs = min(256, kernel.max_threads_per_threadgroup)
+            kernel(
+                out, z_c, r_c, weight, bias, ls,
+                C2, N, float(self.eps),
+                threads=B * tgs, group_size=tgs,
+            )
+            return out
+
+        # Multi-stage path.
+        num_tiles = min(
+            self._MULTI_STAGE_MAX_TILES,
+            max(1, (per_batch_out + self._MULTI_STAGE_TILE_SIZE - 1) // self._MULTI_STAGE_TILE_SIZE),
+        )
+        pow2 = 1
+        while pow2 * 2 <= num_tiles:
+            pow2 *= 2
+        num_tiles = pow2
+
+        scratch = torch.empty((B, num_tiles, 2), dtype=torch.float32, device=z.device)
+        meanvar = torch.empty((B, 2), dtype=torch.float32, device=z.device)
+
+        k1 = _get_kernel("partial_reduce_fp16")
+        k2 = _get_kernel("finalize_meanvar")
+        k3 = _get_kernel("apply_norm_glu_ls_resid_fp16")
+
+        tgs1 = min(256, k1.max_threads_per_threadgroup)
+        tgs2 = min(num_tiles, k2.max_threads_per_threadgroup)
+        pow2 = 1
+        while pow2 * 2 <= tgs2:
+            pow2 *= 2
+        tgs2 = pow2
+        tgs3 = min(256, k3.max_threads_per_threadgroup)
+
+        # Stage 1 reduces over the FULL (2C, N) input.
+        k1(z_c, scratch, per_batch_in, num_tiles,
+           threads=B * num_tiles * tgs1, group_size=tgs1)
+        k2(scratch, meanvar, per_batch_in, num_tiles, float(self.eps),
+           threads=B * tgs2, group_size=tgs2)
+        # Stage 3 tiles the OUTPUT space.
+        k3(out, z_c, r_c, meanvar, weight, bias, ls,
+           per_batch_in, per_batch_out, num_tiles, N, C,
+           threads=B * num_tiles * tgs3, group_size=tgs3)
+        return out
+
+
+class MetalMyGroupNorm(nn.Module):
+    """Replacement for ``demucs.transformer.MyGroupNorm`` on MPS+FP16.
+
+    The original transposes ``(B, T, C) -> (B, C, T)``, runs ``GroupNorm``
+    with ``num_groups=1``, transposes back. Since ``num_groups=1`` is just
+    per-batch normalisation, we fold the operation onto ``(B, T, C)``
+    directly and skip the transposes.
+    """
+
+    def __init__(self, my_gn: nn.GroupNorm) -> None:
+        super().__init__()
+        if my_gn.num_groups != 1:
+            raise ValueError(
+                f"MetalMyGroupNorm assumes num_groups=1 (the only case used "
+                f"in demucs.transformer); got {my_gn.num_groups}."
+            )
+        self.num_channels = my_gn.num_channels
+        self.eps = my_gn.eps
+        if not my_gn.affine:
+            raise ValueError("MetalMyGroupNorm requires affine=True")
+        self.weight = nn.Parameter(my_gn.weight.detach().to(torch.float32).clone())
+        self.bias = nn.Parameter(my_gn.bias.detach().to(torch.float32).clone())
+
+    def _fp16_affine(
+        self, dtype: torch.dtype, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cache = getattr(self, "_aff_cache", None)
+        if cache is None:
+            cache = {}
+            object.__setattr__(self, "_aff_cache", cache)
+        key = (dtype, device)
+        cached = cache.get(key)
+        if cached is None:
+            w = self.weight.detach().to(device=device, dtype=dtype).contiguous()
+            b = self.bias.detach().to(device=device, dtype=dtype).contiguous()
+            cache[key] = (w, b)
+            return w, b
+        return cached
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # FP32 / non-MPS: replicate the original's transpose-then-GroupNorm
+        # contract via F.group_norm directly.
+        if x.dtype == torch.float32 or x.device.type != "mps":
+            x = x.transpose(1, 2)
+            x = F.group_norm(x, 1, self.weight, self.bias, self.eps)
+            return x.transpose(1, 2)
+
+        # FP16 on MPS: the kernel's logical shape is ``(B, C=T*C', N=1)`` —
+        # but it's simpler to reshape to ``(B, 1, T*C)`` and let the kernel
+        # do a single big reduction, then apply the per-channel affine
+        # (broadcast along the last dim) on the way out. We do the affine
+        # ourselves rather than smuggling C into the kernel since the
+        # kernel's affine indexing assumes ``(B, C, N)`` layout.
+        if x.dtype != torch.float16:
+            x_t = x.transpose(1, 2)
+            return F.group_norm(
+                x_t.to(torch.float32), 1, self.weight, self.bias, self.eps
+            ).to(x.dtype).transpose(1, 2)
+
+        # Direct path: reduce over (T, C) per batch, normalise, apply
+        # per-channel affine — all in the kernel via the (B, T, C) layout
+        # treated as (B, 1, T*C). We use the GroupNorm kernel with C=1, N=T*C
+        # so weight/bias must be size 1; we then re-apply affine here.
+        # For simplicity we just call F.group_norm with the FP32-cast path
+        # which is already fast, AND we benefit from skipping the transpose
+        # of the input tensor (still a win).
+        x_contig = x.contiguous()
+        B = x_contig.shape[0]
+        T = x_contig.shape[1]
+        C = x_contig.shape[2]
+        n_per_batch = T * C
+        # Use FP32 cast path. MyGroupNorm sees ``|x|`` up to ~2700 in our
+        # model, which would overflow ``x*x`` in FP16 promoting reductions
+        # — so we always cast here for safety.
+        # Flatten to (B, T*C), reduce in FP32, broadcast back, apply affine.
+        x_flat = x_contig.view(B, n_per_batch).to(torch.float32)
+        mean = x_flat.mean(dim=1, keepdim=True)
+        var = x_flat.var(dim=1, unbiased=False, keepdim=True)
+        x_norm = (x_flat - mean) * torch.rsqrt(var + self.eps)
+        # Apply affine: weight/bias have shape (C,), broadcast over (B, T, ?).
+        x_norm = x_norm.view(B, T, C).to(x.dtype)
+        w, b = self._fp16_affine(x.dtype, x.device)
+        return x_norm * w + b
+
+
+class FusedDConvLayer(nn.Module):
+    """One DConv sub-layer (formerly an ``nn.Sequential`` of 7 ops) folded
+    into 4 calls: ``conv1 → fused_norm_gelu → conv2 → fused_norm_glu_ls_resid``.
+
+    The original layer was::
+
+        Conv1d(C, hidden) → GroupNorm → GELU → Conv1d(hidden, 2C)
+            → GroupNorm → GLU → LayerScale → +residual_x
+
+    We keep the two convs as PyTorch ops (MPS matmul is already fast) and
+    fold every non-conv step into our two big fused Metal kernels. Saves
+    ~5 intermediate tensor writes/reads per call. The residual addition is
+    absorbed into the second fusion.
+    """
+
+    def __init__(
+        self,
+        conv1: nn.Conv1d,
+        norm1: nn.GroupNorm,
+        conv2: nn.Conv1d,
+        norm2: nn.GroupNorm,
+        layer_scale_param: torch.Tensor,
+    ) -> None:
+        super().__init__()
+        self.conv1 = conv1
+        self.norm1_gelu = FusedGroupNormGelu.from_groupnorm(norm1)
+        self.conv2 = conv2
+        self.norm2_envelope = FusedNormGluLayerScaleResid.from_groupnorm_and_scale(
+            norm2, layer_scale_param
+        )
+
+    @classmethod
+    def from_sequential(cls, seq: nn.Sequential) -> "FusedDConvLayer":
+        """Build from the standard 7-op DConv ``nn.Sequential``.
+
+        We expect the canonical layout (``norm=True, attn=False, lstm=False``,
+        which is the HTDemucs default). Anything else and the swap is
+        skipped at the apply_metal_optimizations level.
+        """
+        # Local import; ``LayerScale`` only ships with the transformer module.
+        from ..transformer import LayerScale
+
+        if len(seq) != 7:
+            raise ValueError(f"expected 7-op DConv sequential, got {len(seq)}")
+        conv1, norm1, _act, conv2, norm2, _glu, layer_scale = list(seq)
+        if not isinstance(conv1, nn.Conv1d):
+            raise TypeError("seq[0] must be nn.Conv1d")
+        if not isinstance(norm1, nn.GroupNorm) or norm1.num_groups != 1:
+            raise TypeError("seq[1] must be GroupNorm(num_groups=1)")
+        if not isinstance(conv2, nn.Conv1d):
+            raise TypeError("seq[3] must be nn.Conv1d")
+        if not isinstance(norm2, nn.GroupNorm) or norm2.num_groups != 1:
+            raise TypeError("seq[4] must be GroupNorm(num_groups=1)")
+        if not isinstance(layer_scale, LayerScale):
+            raise TypeError("seq[6] must be LayerScale")
+        return cls(conv1, norm1, conv2, norm2, layer_scale.scale)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.conv1(x)
+        h = self.norm1_gelu(h)
+        h = self.conv2(h)
+        return self.norm2_envelope(h, x)
+
+
+class FusedDConv(nn.Module):
+    """Drop-in for ``demucs.blocks.DConv`` whose layers are
+    :class:`FusedDConvLayer`. Each layer already absorbs the residual add,
+    so the outer loop just chains them.
+    """
+
+    def __init__(self, fused_layers: list[FusedDConvLayer]) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(fused_layers)
+
+    @classmethod
+    def from_dconv(cls, dconv: nn.Module) -> "FusedDConv":
+        # Local import to break the demucs.blocks <-> metal cycle.
+        from ..blocks import DConv
+
+        if not isinstance(dconv, DConv):
+            raise TypeError(f"expected DConv, got {type(dconv).__name__}")
+        return cls([FusedDConvLayer.from_sequential(seq) for seq in dconv.layers])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+class FusedHEncLayer(nn.Module):
+    """Replacement for ``demucs.blocks.HEncLayer`` that uses fused Metal
+    kernels for FP16 inference on MPS. Same forward contract.
+
+    We keep ``self.conv``, ``self.rewrite``, and the layer's ``empty`` /
+    ``stride`` / ``freq`` / ``pad`` flags as on the original. The
+    GroupNorms and the surrounding ``gelu``/``glu`` are folded into single
+    fused calls; the inner DConv (if present) is replaced with FusedDConv.
+    """
+
+    def __init__(self, layer: nn.Module) -> None:
+        super().__init__()
+        from ..blocks import DConv
+
+        # Carry forward the geometry/flags ``apply.py`` and the model's
+        # forward_core inspect on the layer instance.
+        self.kernel_size = layer.kernel_size
+        self.stride = layer.stride
+        self.empty = layer.empty
+        self.freq = layer.freq
+        self.norm = layer.norm
+        self.pad = layer.pad
+
+        self.conv = layer.conv
+        if layer.empty:
+            return
+
+        # norm1 + gelu fusion
+        if isinstance(layer.norm1, nn.GroupNorm) and layer.norm1.num_groups == 1:
+            self.norm1 = FusedGroupNormGelu.from_groupnorm(layer.norm1)
+            self._fused_gelu = True
+        else:
+            self.norm1 = layer.norm1
+            self._fused_gelu = False
+
+        self.rewrite = layer.rewrite
+        if layer.rewrite is not None:
+            if isinstance(layer.norm2, nn.GroupNorm) and layer.norm2.num_groups == 1:
+                self.norm2 = FusedGroupNormGlu.from_groupnorm(layer.norm2)
+                self._fused_glu = True
+            else:
+                self.norm2 = layer.norm2
+                self._fused_glu = False
+        else:
+            self.norm2 = None
+            self._fused_glu = False
+
+        # DConv fusion
+        if layer.dconv is not None and isinstance(layer.dconv, DConv):
+            try:
+                self.dconv = FusedDConv.from_dconv(layer.dconv)
+            except (TypeError, ValueError):
+                self.dconv = layer.dconv
+        else:
+            self.dconv = layer.dconv
+
+    def forward(self, x: torch.Tensor, inject: torch.Tensor | None = None) -> torch.Tensor:
+        if not self.freq and x.dim() == 4:
+            B, C, Fr, T = x.shape
+            x = x.view(B, -1, T)
+        if not self.freq:
+            le = x.shape[-1]
+            if not le % self.stride == 0:
+                x = F.pad(x, (0, self.stride - (le % self.stride)))
+        y = self.conv(x)
+        if self.empty:
+            return y
+        if inject is not None:
+            assert inject.shape[-1] == y.shape[-1]
+            if inject.dim() == 3 and y.dim() == 4:
+                inject = inject[:, :, None]
+            y = y + inject
+        # If norm1 absorbs gelu we just call it; otherwise apply gelu by hand.
+        if self._fused_gelu:
+            y = self.norm1(y)
+        else:
+            y = F.gelu(self.norm1(y))
+        if self.dconv is not None:
+            if self.freq:
+                B, C, Fr, T = y.shape
+                y = y.permute(0, 2, 1, 3).reshape(-1, C, T)
+            y = self.dconv(y)
+            if self.freq:
+                y = y.view(B, Fr, C, T).permute(0, 2, 1, 3)
+        if self.rewrite is not None:
+            if self._fused_glu:
+                z = self.norm2(self.rewrite(y))
+            else:
+                z = F.glu(self.norm2(self.rewrite(y)), dim=1)
+        else:
+            z = y
+        return z
+
+
+class FusedHDecLayer(nn.Module):
+    """Replacement for ``demucs.blocks.HDecLayer`` using fused Metal kernels.
+
+    The ``glu(norm1(rewrite(...)))`` pattern is fused. We do NOT fuse the
+    final ``gelu(norm2(conv_tr(...)))`` because the ``last`` flag (mutated
+    by MultiWrap) decides whether GELU runs at all — keeping that switch
+    in Python keeps things simple. ``norm2`` itself is still
+    ``MetalGroupNorm`` (handled by the outer swap pass).
+    """
+
+    def __init__(self, layer: nn.Module) -> None:
+        super().__init__()
+        from ..blocks import DConv
+
+        # Carry-forward attributes
+        self.pad = layer.pad
+        self.last = layer.last
+        self.freq = layer.freq
+        self.chin = layer.chin
+        self.empty = layer.empty
+        self.stride = layer.stride
+        self.kernel_size = layer.kernel_size
+        self.norm = layer.norm
+        self.context_freq = layer.context_freq
+
+        self.conv_tr = layer.conv_tr
+        self.norm2 = layer.norm2  # left to be swapped to MetalGroupNorm separately
+        if layer.empty:
+            return
+
+        self.rewrite = layer.rewrite
+        if layer.rewrite is not None:
+            if isinstance(layer.norm1, nn.GroupNorm) and layer.norm1.num_groups == 1:
+                self.norm1 = FusedGroupNormGlu.from_groupnorm(layer.norm1)
+                self._fused_glu = True
+            else:
+                self.norm1 = layer.norm1
+                self._fused_glu = False
+        else:
+            self.norm1 = None
+            self._fused_glu = False
+
+        if layer.dconv is not None and isinstance(layer.dconv, DConv):
+            try:
+                self.dconv = FusedDConv.from_dconv(layer.dconv)
+            except (TypeError, ValueError):
+                self.dconv = layer.dconv
+        else:
+            self.dconv = layer.dconv
+
+    def forward(
+        self, x: torch.Tensor, skip: torch.Tensor | None, length: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.freq and x.dim() == 3:
+            B, C, T = x.shape
+            x = x.view(B, self.chin, -1, T)
+        if not self.empty:
+            x = x + skip
+            if self.rewrite is not None:
+                if self._fused_glu:
+                    y = self.norm1(self.rewrite(x))
+                else:
+                    y = F.glu(self.norm1(self.rewrite(x)), dim=1)
+            else:
+                y = x
+            if self.dconv is not None:
+                if self.freq:
+                    B, C, Fr, T = y.shape
+                    y = y.permute(0, 2, 1, 3).reshape(-1, C, T)
+                y = self.dconv(y)
+                if self.freq:
+                    y = y.view(B, Fr, C, T).permute(0, 2, 1, 3)
+        else:
+            y = x
+            assert skip is None
+        z = self.norm2(self.conv_tr(y))
+        if self.freq:
+            if self.pad:
+                z = z[..., self.pad : -self.pad, :]
+        else:
+            z = z[..., self.pad : self.pad + length]
+        if not self.last:
+            z = F.gelu(z)
+        return z, y
+
+
+class MetalMultiheadAttention(nn.Module):
+    """Replacement for ``nn.MultiheadAttention`` on MPS+FP16.
+
+    Q/K/V/output linear projections stay in the parameter dtype — matmul
+    has a fast FP16 path on MPS, and PyTorch's MPSGraph backend already
+    handles those well. The slow part is the SDPA op itself, which on
+    MPS in FP16 is consistently slower than its FP32 path (the FP16 path
+    inserts implicit casts internally). We just cast Q/K/V to FP32, run
+    PyTorch's SDPA, and cast back.
+
+    A custom ``simdgroup_matrix`` Metal SDPA kernel was tried and removed
+    — it was numerically correct but ~2-4x slower than PyTorch's MPSGraph
+    path. PyTorch's tuned matrix primitives won at every length we
+    measured. The wrapper-level FP32-cast trick alone is what gives the
+    real speedup here.
+    """
+
+    def __init__(self, mha: nn.MultiheadAttention) -> None:
+        super().__init__()
+        self.embed_dim = mha.embed_dim
+        self.num_heads = mha.num_heads
+        self.head_dim = mha.embed_dim // mha.num_heads
+        self.batch_first = mha.batch_first
+        self._packed_qkv = mha.in_proj_weight is not None
+        if self._packed_qkv:
+            self.in_proj_weight = mha.in_proj_weight
+            self.in_proj_bias = mha.in_proj_bias
+        else:
+            self.q_proj_weight = mha.q_proj_weight
+            self.k_proj_weight = mha.k_proj_weight
+            self.v_proj_weight = mha.v_proj_weight
+            self.in_proj_bias = mha.in_proj_bias
+        self.out_proj = mha.out_proj
+        # Held for any path we don't optimise (masks, need_weights, etc.).
+        self._fallback = mha
+
+    @classmethod
+    def from_mha(cls, mha: nn.MultiheadAttention) -> "MetalMultiheadAttention":
+        return cls(mha)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+        need_weights: bool = True,
+        attn_mask: torch.Tensor | None = None,
+        average_attn_weights: bool = True,
+        is_causal: bool = False,
+    ) -> tuple[torch.Tensor, None]:
+        # Bail to the wrapped MHA for shapes/configs we don't optimise.
+        if (
+            need_weights
+            or key_padding_mask is not None
+            or not self.batch_first
+            or not self._packed_qkv
+            or query.device.type != "mps"
+            or query.dtype != torch.float16
+        ):
+            return self._fallback(
+                query,
+                key,
+                value,
+                key_padding_mask=key_padding_mask,
+                need_weights=need_weights,
+                attn_mask=attn_mask,
+                average_attn_weights=average_attn_weights,
+                is_causal=is_causal,
+            )
+
+        is_self_attn = query is key and key is value
+        E = self.embed_dim
+        if is_self_attn:
+            qkv = F.linear(query, self.in_proj_weight, self.in_proj_bias)
+            q, k, v = qkv.chunk(3, dim=-1)
+        else:
+            wq = self.in_proj_weight[:E]
+            wk = self.in_proj_weight[E : 2 * E]
+            wv = self.in_proj_weight[2 * E :]
+            if self.in_proj_bias is not None:
+                bq = self.in_proj_bias[:E]
+                bk = self.in_proj_bias[E : 2 * E]
+                bv = self.in_proj_bias[2 * E :]
+            else:
+                bq = bk = bv = None
+            q = F.linear(query, wq, bq)
+            k = F.linear(key, wk, bk)
+            v = F.linear(value, wv, bv)
+
+        B = q.size(0)
+        Lq = q.size(1)
+        Lk = k.size(1)
+        H = self.num_heads
+        D = self.head_dim
+
+        q = q.view(B, Lq, H, D).transpose(1, 2)
+        k = k.view(B, Lk, H, D).transpose(1, 2)
+        v = v.view(B, Lk, H, D).transpose(1, 2)
+
+        # Cast just for the SDPA call. PyTorch's MPS FP16 SDPA runs slower
+        # than its FP32 path because of internal upcasting; the FP16 linear
+        # projections around it still save time.
+        q32 = q.to(torch.float32)
+        k32 = k.to(torch.float32)
+        v32 = v.to(torch.float32)
+        out = F.scaled_dot_product_attention(
+            q32, k32, v32,
+            attn_mask=attn_mask, dropout_p=0.0, is_causal=is_causal,
+        ).to(torch.float16)
+
+        out = out.transpose(1, 2).reshape(B, Lq, self.embed_dim)
+        out = self.out_proj(out)
+        return out, None
+
+
+# ---------------------------------------------------------------------------
+# Public entrypoint
+# ---------------------------------------------------------------------------
+
+
+def apply_metal_optimizations(model: nn.Module) -> dict[str, int]:
+    """Replace FP16-slow ops with Metal-backed equivalents in-place.
+
+    Idempotent (safe to call multiple times) and only swaps modules whose
+    forward semantics we know how to preserve. Returns counts per kind for
+    diagnostic logging.
+
+    Two passes:
+
+    1. **Layer-level fusion**: replace every ``HEncLayer`` / ``HDecLayer``
+       with a fused version that absorbs the ``gelu(norm1(...))`` and
+       ``glu(norm2(rewrite(...)))`` patterns into single Metal kernels.
+       The fused layer also recursively replaces its inner ``DConv`` with
+       a :class:`FusedDConv` whose sub-layers fuse all 7 of the original
+       ``Conv → GroupNorm → GELU → Conv → GroupNorm → GLU → LayerScale``
+       ops down to two Metal kernel launches plus the two convs.
+    2. **Module-level fallback swap** for everything not already covered:
+       remaining plain ``nn.GroupNorm`` (transformer), ``MyGroupNorm``,
+       and ``nn.MultiheadAttention``.
+
+    Two passes are needed because the layer fusion both *consumes* the
+    GroupNorms it fuses and *leaves behind* a few that the second pass
+    still needs to replace (e.g. ``HDecLayer.norm2``, transformer norms).
+    """
+    from ..blocks import HEncLayer, HDecLayer
+    from ..transformer import MyGroupNorm
+
+    counts = {
+        "h_enc_layer": 0,
+        "h_dec_layer": 0,
+        "fused_dconv": 0,
+        "group_norm": 0,
+        "my_group_norm": 0,
+        "multi_head_attention": 0,
+    }
+
+    # Pass 1: layer-level fusion.
+    def _walk_layers(mod: nn.Module) -> None:
+        for name, child in list(mod.named_children()):
+            replacement: nn.Module | None = None
+            if type(child) is HEncLayer:
+                try:
+                    replacement = FusedHEncLayer(child)
+                    counts["h_enc_layer"] += 1
+                    # Count nested DConv replacement too, for visibility.
+                    if isinstance(getattr(replacement, "dconv", None), FusedDConv):
+                        counts["fused_dconv"] += 1
+                except Exception:
+                    pass
+            elif type(child) is HDecLayer:
+                try:
+                    replacement = FusedHDecLayer(child)
+                    counts["h_dec_layer"] += 1
+                    if isinstance(getattr(replacement, "dconv", None), FusedDConv):
+                        counts["fused_dconv"] += 1
+                except Exception:
+                    pass
+            if replacement is not None:
+                params = list(child.parameters())
+                if params:
+                    replacement.to(device=params[0].device)
+                setattr(mod, name, replacement)
+            else:
+                _walk_layers(child)
+
+    _walk_layers(model)
+
+    # Pass 2: replace remaining plain ops (transformer norms, MyGroupNorm,
+    # MultiheadAttention, and any GroupNorm a fused layer didn't absorb).
+    def _walk_modules(mod: nn.Module) -> None:
+        for name, child in list(mod.named_children()):
+            replacement: nn.Module | None = None
+            if isinstance(child, MyGroupNorm):
+                if child.num_groups == 1 and child.affine:
+                    replacement = MetalMyGroupNorm(child)
+                    counts["my_group_norm"] += 1
+            elif type(child) is nn.GroupNorm:
+                if child.num_groups == 1 and child.affine:
+                    replacement = MetalGroupNorm.from_groupnorm(child)
+                    counts["group_norm"] += 1
+            elif type(child) is nn.MultiheadAttention:
+                replacement = MetalMultiheadAttention.from_mha(child)
+                counts["multi_head_attention"] += 1
+            if replacement is not None:
+                params = list(child.parameters())
+                if params:
+                    replacement.to(device=params[0].device)
+                setattr(mod, name, replacement)
+            else:
+                _walk_modules(child)
+
+    _walk_modules(model)
+    return counts
+
+
+__all__ = [
+    "MetalGroupNorm",
+    "MetalMyGroupNorm",
+    "MetalMultiheadAttention",
+    "FusedGroupNormGelu",
+    "FusedGroupNormGlu",
+    "FusedGluLayerScaleResidual",
+    "FusedNormGluLayerScaleResid",
+    "FusedDConvLayer",
+    "FusedDConv",
+    "FusedHEncLayer",
+    "FusedHDecLayer",
+    "apply_metal_optimizations",
+]

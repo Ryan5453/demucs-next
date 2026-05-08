@@ -66,6 +66,33 @@ demucs separate audio_file_1.mp3 audio_file_2.mp3
 demucs separate /path/to/music/folder
 ```
 
+## Performance
+
+50 tracks of [MUSDB18-HQ](https://zenodo.org/records/3338373), `htdemucs`, `shifts=1`, `split_overlap=0.25`. Steady-state mean seconds per track. Reproduce with `python benchmark.py --include-upstream`.
+
+### `demucs-next`
+
+| Hardware | Backend | s/track | Mean SDR |
+|---|---|---:|---:|
+| RTX A4000 | CUDA FP16 | 2.85 | 8.297 |
+| RTX A4000 | CUDA FP32 | 4.42 | 8.297 |
+| M2 Max | MPS FP16 | 8.65 | 8.318 |
+| M2 Max | MPS FP32 | 12.74 | 8.318 |
+| M2 Max | Browser ONNX (WebGPU) | 17.53 | 8.400 |
+| Intel i9-10900X | CPU FP32 | 49.94 | 8.318 |
+| M2 Max | CPU FP32 | 86.48 | 8.318 |
+
+### Upstream demucs (`main`, `4.1.0a3`)
+
+| Hardware | Backend | s/track | Mean SDR |
+|---|---|---:|---:|
+| RTX A4000 | CUDA FP32 | 7.63 | 8.246 |
+| M2 Max | MPS FP32 | 10.05 | 8.288 |
+| Intel i9-10900X | CPU FP32 | 54.26 | 8.299 |
+| M2 Max | CPU FP32 | 110.99 | 8.306 |
+
+`demucs-next` is faster than upstream on every config except M2 Max MPS FP32 (a torch 2.7 -> 2.8 `aten::copy_` regression we can't avoid; the recommended MPS FP16 path beats it). SDR equals or exceeds upstream everywhere.
+
 ## Cog Usage
 
 Demucs provides a [Cog](https://github.com/replicate/cog), which allows you to easily deploy a Demucs model as a REST API. You can alternatively use the hosted version at [Replicate](https://replicate.com/ryan5453/demucs).
@@ -76,4 +103,4 @@ Demucs provides a Python API for separating audio files. Please refer to the [AP
 
 ## Changelog
 
-The [changelog](docs/changelog.md) contains information about the changes between versions of demucs-next. 
+The [changelog](docs/changelog.md) contains information about the changes between versions of demucs-next.

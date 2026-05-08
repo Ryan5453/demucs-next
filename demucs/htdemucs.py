@@ -444,6 +444,32 @@ class HTDemucs(nn.Module):
             )
         return training_length
 
+    def _cached_freq_emb(
+        self, num_freqs: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """
+        Return the frequency-positional embedding pre-shaped for broadcast,
+        memoised by ``(num_freqs, device, dtype)``.
+
+        :param num_freqs: Number of frequency bins (``Fq``).
+        :param device: Device the embedding should live on.
+        :param dtype: Dtype the embedding should match.
+        :return: Tensor of shape ``(1, C, Fq, 1)`` ready to add to the encoder input.
+        """
+        cache = getattr(self, "_freq_emb_cache", None)
+        if cache is None:
+            cache = {}
+            object.__setattr__(self, "_freq_emb_cache", cache)
+        key = (num_freqs, device, dtype)
+        emb = cache.get(key)
+        if emb is None:
+            frs = torch.arange(num_freqs, device=device)
+            emb = self.freq_emb(frs).t()[None, :, :, None]
+            if emb.dtype != dtype:
+                emb = emb.to(dtype)
+            cache[key] = emb
+        return emb
+
     def forward_core(
         self, x: torch.Tensor, xt: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -472,8 +498,7 @@ class HTDemucs(nn.Module):
                     inject = xt
             x = encode(x, inject)
             if idx == 0 and self.freq_emb is not None:
-                frs = torch.arange(x.shape[-2], device=x.device)
-                emb = self.freq_emb(frs).t()[None, :, :, None].expand_as(x)
+                emb = self._cached_freq_emb(x.shape[-2], x.device, x.dtype)
                 x = x + self.freq_emb_scale * emb
             saved.append(x)
 
@@ -529,13 +554,13 @@ class HTDemucs(nn.Module):
 
         B, C, Fq, T = x.shape
 
-        mean = x.mean(dim=(1, 2, 3), keepdim=True)
-        std = x.std(dim=(1, 2, 3), keepdim=True)
+        var, mean = torch.var_mean(x, dim=(1, 2, 3), keepdim=True)
+        std = torch.sqrt(var)
         x = (x - mean) / (1e-5 + std)
 
         xt = mix
-        meant = xt.mean(dim=(1, 2), keepdim=True)
-        stdt = xt.std(dim=(1, 2), keepdim=True)
+        var_t, meant = torch.var_mean(xt, dim=(1, 2), keepdim=True)
+        stdt = torch.sqrt(var_t)
         xt = (xt - meant) / (1e-5 + stdt)
 
         model_dtype = next(self.parameters()).dtype

@@ -25,7 +25,7 @@ let loadedSources: string[] = [];
 let currentBackend: 'webgpu' | 'wasm' | null = null;
 let usingWorker = false;
 
-// Model URLs on HuggingFace
+// Model URLs on HuggingFace.
 const MODEL_URLS: Record<ModelType, string> = {
     'htdemucs': 'https://huggingface.co/Ryan5453/demucs-onnx/resolve/main/htdemucs.onnx',
     'htdemucs_6s': 'https://huggingface.co/Ryan5453/demucs-onnx/resolve/main/htdemucs_6s.onnx',

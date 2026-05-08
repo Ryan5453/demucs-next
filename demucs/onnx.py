@@ -117,18 +117,17 @@ def export_to_onnx(
     model_name: str = "htdemucs",
     output_path: str | None = None,
     opset_version: int = 17,
-    segment_seconds: float = 10.0,
 ) -> str:
     """
-    Export Demucs model to ONNX format.
+    Export a Demucs model to ONNX. Traced at the model's training length
+    so runtime callers must feed exactly that segment size.
 
-    :param model_name: Name of the model to export
-    :param output_path: Path to save the ONNX model (defaults to {model_name}.onnx)
-    :param opset_version: ONNX opset version
-    :param segment_seconds: Audio segment length in seconds
-    :return: Path to the exported ONNX model
-    :raises ImportError: If the onnx package is not installed
-    :raises ValueError: If the model is not an HTDemucs instance
+    :param model_name: Name of the model to export.
+    :param output_path: Path to save the ONNX model (defaults to ``{model_name}.onnx``).
+    :param opset_version: ONNX opset version.
+    :return: Path to the exported ONNX model.
+    :raises ImportError: If the ``onnx`` package is not installed.
+    :raises ValueError: If the resolved model is not an ``HTDemucs`` instance.
     """
     try:
         import onnx
@@ -155,7 +154,7 @@ def export_to_onnx(
     wrapper.eval()
 
     sample_rate = model.samplerate
-    segment_samples = int(segment_seconds * sample_rate)
+    segment_samples = int(model.max_allowed_segment * sample_rate)
     nfft = model.nfft
     hop_length = model.hop_length
 

@@ -62,22 +62,6 @@ def separate_command(
             rich_help_panel="Processing",
         ),
     ] = 1,
-    split: Annotated[
-        bool,
-        typer.Option(
-            help="Split audio in chunks to save memory",
-            rich_help_panel="Processing",
-        ),
-    ] = True,
-    split_size: Annotated[
-        int | None,
-        typer.Option(
-            "--split-size",
-            min=1,
-            help="Size of each chunk in seconds, smaller values use less GPU memory but process slower",
-            rich_help_panel="Processing",
-        ),
-    ] = None,
     split_overlap: Annotated[
         float,
         typer.Option(
@@ -166,11 +150,14 @@ def separate_command(
     if not ensure_model_available(selected_model_name):
         return
 
+    # FP16 is on by default for CUDA (tensor cores) and MPS (custom Metal
+    # kernels — see ``demucs.metal``). CPU stays in FP32.
+    fp16_devices = {DeviceType.cuda.value, DeviceType.mps.value}
     separator = Separator(
         model=selected_model_name,
         device=device.value,
         only_load=only_load_stem,
-        dtype=torch.float16 if device.value == DeviceType.cuda.value else None,
+        dtype=torch.float16 if device.value in fp16_devices else None,
         compile=compile,
     )
 
@@ -219,8 +206,6 @@ def separate_command(
                 separated = separator.separate(
                     audio=track,
                     shifts=shifts,
-                    split=split,
-                    split_size=split_size,
                     split_overlap=split_overlap,
                     seed=seed,
                     progress_callback=audio_callback,

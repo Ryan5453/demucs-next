@@ -202,8 +202,9 @@ class Separator:
         :param device: Device to use for processing (must be "cpu", "cuda", or "mps")
         :param only_load: If specified, load only the specialized model for this stem
                          (only applicable to bag-of-models like htdemucs_ft)
-        :param dtype: Set to torch.float16 for half-precision inference on CUDA.
-                     If None, uses default float32. Model weights are cast at init time.
+        :param dtype: Set to torch.float16 for half-precision inference. Supported on
+                     CUDA and MPS. Model weights are cast at init time. CPU does not benefit
+                     from reduced precision and is rejected.
         :param compile: If True, apply ``torch.compile`` for faster inference after an
                        initial warmup. Best for API servers or batch processing; adds
                        significant latency to the first forward pass.
@@ -217,16 +218,14 @@ class Separator:
                 f"Invalid device '{device}'. Must be one of: {', '.join(sorted(valid_devices))}"
             )
 
-        # Validate dtype — only FP16 on CUDA is supported
         if dtype is not None:
             if dtype != torch.float16:
                 raise ValidationError(
                     f"Invalid dtype '{dtype}'. Only torch.float16 is supported."
                 )
-            if device != "cuda":
+            if device == "cpu":
                 raise ValidationError(
-                    "float16 inference is only supported on CUDA. "
-                    "CPU and MPS do not benefit from reduced precision."
+                    "float16 inference is not supported on CPU. Use cuda or mps."
                 )
 
         self.device = device
@@ -268,6 +267,19 @@ class Separator:
                     m.to(dtype=self.dtype)
             else:
                 self.model.to(dtype=self.dtype)
+
+        # MPS-specific FP16 optimisations: PyTorch 2.11's MPS backend has
+        # slow paths for FP16 GroupNorm and SDPA. We swap in custom Metal
+        # kernels and a wrapped attention module that route around those.
+        # No-op for CUDA (handled by tensor cores) and CPU (no FP16 path).
+        if self.dtype == torch.float16 and self.device == "mps":
+            from .metal import apply_metal_optimizations
+
+            if isinstance(self.model, ModelEnsemble):
+                for m in self.model.models:
+                    apply_metal_optimizations(m)
+            else:
+                apply_metal_optimizations(self.model)
 
         # torch.compile: compile only the neural network core of HTDemucs.
         # This avoids compiling STFT/iSTFT and complex tensor ops, which are
@@ -381,8 +393,6 @@ class Separator:
         self,
         audio: tuple[Tensor, int] | Path | str | bytes,
         shifts: int = 1,
-        split: bool = True,
-        split_size: int | None = None,
         split_overlap: float = 0.25,
         seed: int | None = None,
         progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
@@ -390,25 +400,15 @@ class Separator:
         chunk_batch_size: int | None = None,
     ) -> SeparatedSources:
         """
-        Separate audio into stems. Accepts tensor with sample rate, file path, or raw bytes.
+        Separate audio into stems. Accepts a (tensor, sample_rate) pair, a file path, or raw bytes.
 
-        :param audio: Audio input - can be:
-                     - A tuple of (Tensor, sample_rate) where Tensor is shape [channels, samples]
-                     - A file path (str or Path)
-                     - Raw audio bytes
-        :param shifts: Number of random shifts for equivariant stabilization (1-20)
-                      Higher values improve quality but increase processing time
-        :param split_overlap: Overlap between split chunks (0.0 to 1.0)
-                             Higher values improve quality at chunk boundaries
-        :param split: Whether to split the input into chunks for processing
-        :param split_size: Length (in seconds) of each chunk (only used if split=True)
-        :param seed: Optional random seed for reproducible shift-based inference
-        :param progress_callback: Optional callback for progress updates during audio processing
-        :param use_only_stem: If specified and model is a ModelEnsemble, only use the model
-                             specialized for this stem (performance optimization for Cog)
-        :param chunk_batch_size: Number of audio chunks to process simultaneously when splitting.
-                               Higher values use more VRAM but improve throughput by saturating GPU compute.
-                               Defaults to 4 on CUDA (up to 1.9x faster), 1 on CPU/MPS.
+        :param audio: Audio input - tuple of (Tensor, sample_rate), file path, or raw bytes.
+        :param shifts: Number of random shifts for equivariant stabilization (1-20).
+        :param split_overlap: Overlap between segments (0.0 to 1.0).
+        :param seed: Optional random seed for reproducible shift-based inference.
+        :param progress_callback: Optional callback for progress updates.
+        :param use_only_stem: For ``ModelEnsemble``, only run the sub-model specialised for this stem.
+        :param chunk_batch_size: Chunks processed in parallel. Defaults to 4 on CUDA, 2 on MPS, 1 on CPU.
         :return: SeparatedSources object containing the separated stems
         :raises ValidationError: If any parameter value is invalid
         """
@@ -433,25 +433,19 @@ class Separator:
                 f"split_overlap must be a float between 0.0 (inclusive) and 1.0 (exclusive), got {split_overlap}"
             )
 
-        # Validate and adjust split_size parameter
-        if split_size is not None:
-            if not isinstance(split_size, (int, float)) or split_size < 1:
-                raise ValidationError(
-                    f"split_size must be a number >= 1 if provided, got {split_size}"
-                )
-            max_allowed = self.model.max_allowed_segment
-            if split_size > max_allowed and max_allowed != float("inf"):
-                split_size = max_allowed
-
         # Validate progress_callback parameter
         if progress_callback is not None and not callable(progress_callback):
             raise ValidationError(
                 f"progress_callback must be callable if provided, got {type(progress_callback)}"
             )
 
-        # Auto-select chunk_batch_size based on device if not specified
         if chunk_batch_size is None:
-            chunk_batch_size = 4 if self.device == "cuda" else 1
+            if self.device == "cuda":
+                chunk_batch_size = 4
+            elif self.device == "mps":
+                chunk_batch_size = 2
+            else:
+                chunk_batch_size = 1
 
         # Validate chunk_batch_size parameter
         if not isinstance(chunk_batch_size, int) or chunk_batch_size < 1:
@@ -480,9 +474,7 @@ class Separator:
             wav[None],
             device=self.device,
             shifts=shifts,
-            split=split,
             overlap=split_overlap,
-            segment=split_size,
             progress_callback=progress_callback,
             use_only_stem=use_only_stem,
             chunk_batch_size=chunk_batch_size,

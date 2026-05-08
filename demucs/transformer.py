@@ -183,7 +183,12 @@ class ScaledEmbedding(nn.Module):
         self.boost = boost
 
     @property
-    def weight(self):
+    def weight(self) -> torch.Tensor:
+        """
+        Boost-scaled embedding matrix.
+
+        :return: ``embedding.weight * boost``.
+        """
         return self.embedding.weight * self.boost
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -616,6 +621,64 @@ class CrossTransformerEncoder(nn.Module):
 
                 self.layers_t.append(CrossTransformerEncoderLayer(**kwargs_common))
 
+        # Positional embedding caches keyed by shape/device/dtype.
+        self._pos_emb_2d_cache: dict[
+            tuple[int, int, int, torch.device, torch.dtype], torch.Tensor
+        ] = {}
+        self._pos_emb_t_cache: dict[
+            tuple[int, int, torch.device, torch.dtype], torch.Tensor
+        ] = {}
+
+    def _cached_pos_emb_2d(
+        self, C: int, Fr: int, T1: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """
+        Return the 2D sin positional embedding pre-permuted to
+        ``(1, T1*Fr, C)``, memoised by ``(C, Fr, T1, device, dtype)``.
+
+        :param C: Channel dimension.
+        :param Fr: Frequency dimension.
+        :param T1: Time dimension.
+        :param device: Device the embedding lives on.
+        :param dtype: Dtype the embedding matches.
+        :return: Pre-shaped embedding tensor.
+        """
+        key = (C, Fr, T1, device, dtype)
+        emb = self._pos_emb_2d_cache.get(key)
+        if emb is None:
+            base = create_2d_sin_embedding(C, Fr, T1, device, self.max_period)
+            emb = base.permute(0, 3, 2, 1).reshape(1, T1 * Fr, C).to(dtype)
+            self._pos_emb_2d_cache[key] = emb
+        return emb
+
+    def _cached_pos_emb_t(
+        self, T2: int, C: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor | None:
+        """
+        Return the 1D sin positional embedding pre-permuted to
+        ``(1, T2, C)``, memoised by ``(T2, C, device, dtype)``. Only the
+        deterministic ``sin`` mode without random shift is safe to cache;
+        every other mode returns ``None`` so the caller falls back to
+        recomputing per call.
+
+        :param T2: Sequence length (time dimension).
+        :param C: Channel dimension.
+        :param device: Device the embedding lives on.
+        :param dtype: Dtype the embedding matches.
+        :return: Pre-shaped embedding tensor, or ``None`` for non-cacheable modes.
+        """
+        if self.emb != "sin" or self.sin_random_shift > 0:
+            return None
+        key = (T2, C, device, dtype)
+        emb = self._pos_emb_t_cache.get(key)
+        if emb is None:
+            base = create_sin_embedding(
+                T2, C, shift=0, device=device, max_period=self.max_period
+            )
+            emb = base.permute(1, 0, 2).contiguous().to(dtype)
+            self._pos_emb_t_cache[key] = emb
+        return emb
+
     def forward(self, x: torch.Tensor, xt: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass through alternating self-attention and cross-attention layers.
@@ -625,22 +688,22 @@ class CrossTransformerEncoder(nn.Module):
         :return: Tuple of transformed (spectrogram, temporal) tensors
         """
         B, C, Fr, T1 = x.shape
-        pos_emb_2d = create_2d_sin_embedding(
-            C, Fr, T1, x.device, self.max_period
-        )  # (1, C, Fr, T1)
-        pos_emb_2d = pos_emb_2d.permute(0, 3, 2, 1).reshape(
-            1, T1 * Fr, C
-        )  # "1 c fr t1 -> 1 (t1 fr) c", broadcasts over batch
+        pos_emb_2d = self._cached_pos_emb_2d(C, Fr, T1, x.device, x.dtype)
         x = x.permute(0, 3, 2, 1).reshape(B, T1 * Fr, C)  # "b c fr t1 -> b (t1 fr) c"
         x = self.norm_in(x)
-        x = x + self.weight_pos_embed * pos_emb_2d.to(x.dtype)
+        x = x + self.weight_pos_embed * pos_emb_2d
 
         B, C, T2 = xt.shape
         xt = xt.permute(0, 2, 1)  # "b c t2 -> b t2 c"
-        pos_emb = self._get_pos_embedding(T2, B, C, x.device)
-        pos_emb = pos_emb.permute(1, 0, 2)  # "t2 b c -> b t2 c"
-        xt = self.norm_in_t(xt)
-        xt = xt + self.weight_pos_embed * pos_emb.to(xt.dtype)
+        cached_t = self._cached_pos_emb_t(T2, C, x.device, xt.dtype)
+        if cached_t is not None:
+            xt = self.norm_in_t(xt)
+            xt = xt + self.weight_pos_embed * cached_t
+        else:
+            pos_emb = self._get_pos_embedding(T2, B, C, x.device)
+            pos_emb = pos_emb.permute(1, 0, 2)  # "t2 b c -> b t2 c"
+            xt = self.norm_in_t(xt)
+            xt = xt + self.weight_pos_embed * pos_emb.to(xt.dtype)
 
         for idx in range(self.num_layers):
             if idx % 2 == self.classic_parity:

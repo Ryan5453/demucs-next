@@ -1,0 +1,1255 @@
+from __future__ import annotations
+
+import csv
+import gc
+import hashlib
+import json
+import math
+import shutil
+import statistics
+import subprocess
+import sys
+import traceback
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from time import perf_counter
+from typing import Any
+
+import torch
+import typer
+
+from demucs.api import Separator
+from demucs.cli.models import ensure_model_available
+
+REFERENCE_STEMS = ("drums", "bass", "other", "vocals", "guitar", "piano")
+DEFAULT_MODELS = ["htdemucs", "htdemucs_ft"]
+DEFAULT_PRECISIONS = ["fp32", "fp16"]
+DEFAULT_COMPILE_MODES = [False, True]
+DEFAULT_SHIFTS = [1, 2, 4]
+DEFAULT_SPLIT_OVERLAPS = [0.1, 0.25, 0.5]
+DEFAULT_UPSTREAM_VERSION = "main"
+DEFAULT_UPSTREAM_PYTHON = "3.11"
+UPSTREAM_VENV_ROOT = Path(".upstream-venv")
+UPSTREAM_REPO = "https://github.com/adefossez/demucs.git"
+
+# Worker source executed inside the isolated upstream-demucs venv. Piped to the
+# venv's interpreter via stdin (`python -`) so we don't need a sibling .py file.
+# Communicates with the parent via NDJSON on stdout: one JSON object per line.
+# Anything non-JSON on stdout is treated as upstream's own logging and surfaced
+# verbatim. The worker only depends on torch/torchaudio + upstream demucs and
+# must NOT import anything from the demucs-next repo (different interpreter).
+UPSTREAM_WORKER_SOURCE = r'''
+from __future__ import annotations
+import argparse, json, math, sys, time, traceback
+from pathlib import Path
+import torch
+import torchaudio
+
+def _emit(payload: dict) -> None:
+    """
+    Write one NDJSON event to stdout for the parent benchmark process.
+
+    :param payload: JSON-serialisable dict describing the event.
+    """
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+def _compute_sdr(estimate: torch.Tensor, reference: torch.Tensor) -> float:
+    """
+    Compute SDR (in dB) using the same formula as the parent benchmark.
+
+    :param estimate: Separator output for the stem.
+    :param reference: Ground-truth stem.
+    :return: SDR in dB, ``nan`` if the reference is silent, ``inf`` if the
+        residual is below the numeric floor.
+    """
+    estimate = estimate.to(dtype=torch.float64, device="cpu")
+    reference = reference.to(dtype=torch.float64, device="cpu")
+    length = min(estimate.shape[-1], reference.shape[-1])
+    estimate = estimate[..., :length]
+    reference = reference[..., :length]
+    noise = estimate - reference
+    reference_energy = torch.sum(reference * reference).item()
+    noise_energy = torch.sum(noise * noise).item()
+    if reference_energy <= 0.0:
+        return float("nan")
+    if noise_energy <= 1e-12:
+        return float("inf")
+    return 10.0 * math.log10(reference_energy / noise_energy)
+
+def main() -> int:
+    """
+    Worker entry point. Parses CLI args, loads upstream demucs, and runs
+    the requested track list, emitting NDJSON events on stdout.
+
+    :return: Process exit code (0 on success, 2 on init failure).
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--device", required=True)
+    parser.add_argument("--precision", default="fp32", choices=["fp32", "fp16"])
+    parser.add_argument("--shifts", type=int, required=True)
+    parser.add_argument("--overlap", type=float, required=True)
+    parser.add_argument("--tracks-json", required=True)
+    args = parser.parse_args()
+
+    try:
+        from demucs.api import Separator
+    except Exception as exc:
+        _emit({"event": "init_error", "error_type": type(exc).__name__,
+               "error_message": "failed to import upstream demucs: " + str(exc)})
+        return 2
+
+    if args.precision == "fp16":
+        # Upstream has no end-to-end fp16 plumbing (model.half() leaves inputs
+        # float32 and crashes mid-track); refuse cleanly so the parent records it.
+        _emit({"event": "init_error", "error_type": "UnsupportedPrecision",
+               "error_message": "Upstream demucs does not support fp16 inference end-to-end."})
+        return 0
+
+    tracks = json.loads(Path(args.tracks_json).read_text())
+
+    init_t0 = time.perf_counter()
+    try:
+        # No ``segment=`` on purpose — upstream's default is the model's
+        # training length, which is exactly what we use locally too.
+        separator = Separator(
+            model=args.model, device=args.device, shifts=args.shifts,
+            overlap=args.overlap,
+        )
+    except Exception as exc:
+        _emit({"event": "init_error", "error_type": type(exc).__name__,
+               "error_message": str(exc), "traceback": traceback.format_exc(limit=3)})
+        return 2
+    _emit({"event": "init_complete", "init_sec": time.perf_counter() - init_t0})
+
+    for track in tracks:
+        track_name = track["name"]
+        stem_paths = track["stem_paths"]
+        t0 = time.perf_counter()
+        try:
+            _, separated = separator.separate_audio_file(Path(track["mixture_path"]))
+            elapsed = time.perf_counter() - t0
+            stem_scores = {}
+            for stem_name, ref_path in stem_paths.items():
+                if stem_name not in separated:
+                    continue
+                reference, _ = torchaudio.load(ref_path)
+                stem_scores[stem_name] = _compute_sdr(separated[stem_name], reference)
+            _emit({"event": "track_complete", "track_name": track_name,
+                   "elapsed_sec": elapsed, "stem_scores": stem_scores})
+        except Exception as exc:
+            _emit({"event": "track_error", "track_name": track_name,
+                   "elapsed_sec": time.perf_counter() - t0,
+                   "error_type": type(exc).__name__, "error_message": str(exc),
+                   "traceback": traceback.format_exc(limit=3)})
+
+    _emit({"event": "done"})
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+app = typer.Typer(add_completion=False, no_args_is_help=True)
+
+
+@dataclass(frozen=True)
+class BenchmarkTrack:
+    name: str
+    directory: Path
+    mixture_path: Path
+    reference_stems: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class BenchmarkConfig:
+    config_id: str
+    model: str
+    precision: str
+    compile: bool
+    shifts: int
+    split_overlap: float
+    variant: str = "local"
+    upstream_version: str = ""
+
+
+def _format_float(value: float | None) -> str:
+    """
+    Render a float for the CSV output. ``None`` becomes empty; NaN/Inf get
+    spelled out so the CSV stays parseable.
+
+    :param value: Float to format, or ``None``.
+    :return: String representation suitable for the benchmark CSV.
+    """
+    if value is None:
+        return ""
+    if math.isnan(value):
+        return "nan"
+    if math.isinf(value):
+        return "inf" if value > 0 else "-inf"
+    return f"{value:.6f}"
+
+
+def _build_track_seed(seed: int, track_name: str) -> int:
+    """
+    Derive a deterministic per-track seed from the base seed and track name.
+
+    :param seed: Base benchmark seed.
+    :param track_name: Track name used as the keyspace.
+    :return: 31-bit positive integer seed.
+    """
+    digest = hashlib.blake2b(
+        f"{seed}:{track_name}".encode("utf-8"),
+        digest_size=8,
+    ).digest()
+    return int.from_bytes(digest, "big") % (2**31)
+
+
+def _compute_sdr(estimate: torch.Tensor, reference: torch.Tensor) -> float:
+    """
+    Compute SDR (in dB) between an estimated stem and its reference.
+
+    :param estimate: Separator output for the stem.
+    :param reference: Ground-truth stem.
+    :return: SDR in dB, ``nan`` if the reference has no energy, ``inf`` if
+        the residual is below the numeric floor.
+    """
+    estimate = estimate.to(dtype=torch.float64, device="cpu")
+    reference = reference.to(dtype=torch.float64, device="cpu")
+
+    length = min(estimate.shape[-1], reference.shape[-1])
+    estimate = estimate[..., :length]
+    reference = reference[..., :length]
+
+    noise = estimate - reference
+    reference_energy = torch.sum(reference * reference).item()
+    noise_energy = torch.sum(noise * noise).item()
+
+    if reference_energy <= 0.0:
+        return float("nan")
+    if noise_energy <= 1e-12:
+        return float("inf")
+    return 10.0 * math.log10(reference_energy / noise_energy)
+
+
+def _discover_tracks(musdb_root: Path) -> list[BenchmarkTrack]:
+    """
+    Walk a MUSDB18-HQ split directory and return the per-track records.
+
+    :param musdb_root: Path to a MUSDB split (e.g. the ``test`` directory).
+    :return: Sorted list of ``BenchmarkTrack`` entries with ``mixture.wav``
+        and at least one reference stem.
+    :raises typer.BadParameter: If ``musdb_root`` is missing or contains no usable tracks.
+    """
+    if not musdb_root.is_dir():
+        raise typer.BadParameter(f"MUSDB root does not exist: {musdb_root}")
+
+    tracks: list[BenchmarkTrack] = []
+    for track_dir in sorted(d for d in musdb_root.iterdir() if d.is_dir()):
+        mixture_path = track_dir / "mixture.wav"
+        reference_stems = tuple(
+            stem for stem in REFERENCE_STEMS if (track_dir / f"{stem}.wav").exists()
+        )
+
+        if not mixture_path.exists() or not reference_stems:
+            continue
+
+        tracks.append(
+            BenchmarkTrack(
+                name=track_dir.name,
+                directory=track_dir,
+                mixture_path=mixture_path,
+                reference_stems=reference_stems,
+            )
+        )
+
+    if not tracks:
+        raise typer.BadParameter(
+            f"No MUSDB tracks with mixture.wav and reference stems found under {musdb_root}"
+        )
+    return tracks
+
+
+def _build_configs(
+    models: list[str],
+    precisions: list[str],
+    compile_modes: list[bool],
+    shifts_values: list[int],
+    split_overlaps: list[float],
+    include_upstream: bool = False,
+    upstream_version: str = DEFAULT_UPSTREAM_VERSION,
+) -> list[BenchmarkConfig]:
+    """
+    Cartesian-product the input axes into a list of benchmark configs,
+    optionally appending an upstream-comparison config alongside each
+    eligible local config (no compile, fp32 only).
+
+    :param models: Model names to benchmark.
+    :param precisions: Precision modes (``"fp32"``, ``"fp16"``).
+    :param compile_modes: Whether ``torch.compile`` is enabled for the run.
+    :param shifts_values: Shift counts for equivariant stabilization.
+    :param split_overlaps: Overlap fractions between consecutive segments.
+    :param include_upstream: If True, also emit upstream-variant configs.
+    :param upstream_version: Git ref of upstream demucs to install when included.
+    :return: All configs in evaluation order.
+    """
+    configs: list[BenchmarkConfig] = []
+    config_index = 1
+
+    for model in models:
+        for precision in precisions:
+            for compile_mode in compile_modes:
+                for shifts in shifts_values:
+                    for split_overlap in split_overlaps:
+                        configs.append(
+                            BenchmarkConfig(
+                                config_id=f"cfg_{config_index:04d}",
+                                model=model,
+                                precision=precision,
+                                compile=compile_mode,
+                                shifts=shifts,
+                                split_overlap=split_overlap,
+                                variant="local",
+                            )
+                        )
+                        config_index += 1
+                        if (
+                            include_upstream
+                            and compile_mode is False
+                            and precision == "fp32"
+                        ):
+                            # Upstream demucs has no torch.compile path and
+                            # no end-to-end FP16 plumbing; only emit upstream
+                            # rows for FP32, no-compile combinations.
+                            configs.append(
+                                BenchmarkConfig(
+                                    config_id=f"cfg_{config_index:04d}",
+                                    model=model,
+                                    precision=precision,
+                                    compile=False,
+                                    shifts=shifts,
+                                    split_overlap=split_overlap,
+                                    variant="upstream",
+                                    upstream_version=upstream_version,
+                                )
+                            )
+                            config_index += 1
+    return configs
+
+
+def _ensure_upstream_venv(version: str, python_version: str) -> Path:
+    """Create (or reuse) an isolated venv with `demucs==<version>` installed.
+
+    Uses `uv` if available (fast); falls back to `python -m venv` + `pip`.
+    The venv lives at `.upstream-venv/<version>/` so multiple versions can
+    coexist and the layout is gitignored.
+    """
+    venv_dir = (UPSTREAM_VENV_ROOT / version).resolve()
+    python_bin = venv_dir / "bin" / "python"
+    marker = venv_dir / ".demucs-installed"
+    if python_bin.exists() and marker.exists():
+        return venv_dir
+
+    venv_dir.parent.mkdir(parents=True, exist_ok=True)
+    if venv_dir.exists() and not marker.exists():
+        shutil.rmtree(venv_dir)
+
+    uv_bin = shutil.which("uv")
+    # Install upstream from git rather than PyPI: PyPI's last release (4.0.1)
+    # predates upstream's `demucs.api.Separator`, which we depend on. The git
+    # `<2.2` torchaudio cap pulls torch 2.1.x, which was built against numpy 1
+    # — pinning numpy<2 avoids "Numpy is not available" at runtime. Modern
+    # setuptools no longer installs `pkg_resources` by default but several
+    # legacy deps (dora-search, lameenc) still import it, so we pull it in.
+    install_targets = [
+        f"demucs @ git+{UPSTREAM_REPO}@{version}",
+        "numpy<2",
+        # setuptools >=80 removed `pkg_resources`; legacy upstream deps still
+        # import it, so pin below the cutoff.
+        "setuptools<80",
+        # The worker calls torchaudio.load() to read reference stems for SDR.
+        # torchaudio 2.1's bundled backends are gone; soundfile fills the gap.
+        "soundfile",
+    ]
+    if uv_bin is not None:
+        typer.echo(f"Creating upstream venv via uv at {venv_dir} (python {python_version})")
+        subprocess.run(
+            [uv_bin, "venv", "--python", python_version, str(venv_dir)],
+            check=True,
+        )
+        typer.echo(f"Installing demucs=={version} into upstream venv (this can take a few minutes)")
+        subprocess.run(
+            [
+                uv_bin, "pip", "install",
+                "--python", str(python_bin),
+                *install_targets,
+            ],
+            check=True,
+        )
+    else:
+        typer.echo(f"Creating upstream venv via python -m venv at {venv_dir}")
+        subprocess.run(
+            [sys.executable, "-m", "venv", str(venv_dir)],
+            check=True,
+        )
+        typer.echo(f"Installing demucs=={version} into upstream venv (this can take a few minutes)")
+        subprocess.run(
+            [
+                str(python_bin), "-m", "pip", "install",
+                *install_targets,
+            ],
+            check=True,
+        )
+
+    marker.write_text(f"demucs=={version}\n")
+    return venv_dir
+
+
+def _run_upstream_config(
+    config: BenchmarkConfig,
+    tracks: list[BenchmarkTrack],
+    device: str,
+    seed: int | None,
+    chunk_batch_size: int | None,
+    output_dir: Path,
+    upstream_python_version: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Run one upstream-variant config in a subprocess.
+
+    Returns (detail_rows, summary_extras) where summary_extras carries
+    aggregate fields (model_init_sec, error info, etc.) to be merged into
+    the summary row by the caller.
+    """
+    venv_dir = _ensure_upstream_venv(config.upstream_version, upstream_python_version)
+    venv_python = venv_dir / "bin" / "python"
+
+    tracks_payload = [
+        {
+            "name": track.name,
+            "mixture_path": str(track.mixture_path),
+            "reference_stems": list(track.reference_stems),
+            "stem_paths": {
+                stem: str(track.directory / f"{stem}.wav")
+                for stem in track.reference_stems
+            },
+        }
+        for track in tracks
+    ]
+    tracks_json_path = output_dir / f"_tmp_upstream_tracks_{config.config_id}.json"
+    tracks_json_path.write_text(json.dumps(tracks_payload))
+
+    cmd = [
+        # ``-P`` keeps cwd (the demucs-next repo) off ``sys.path`` so the
+        # subprocess imports the upstream ``demucs`` from the venv rather than
+        # our local checkout. ``-`` reads the worker source from stdin.
+        str(venv_python), "-P", "-",
+        "--model", config.model,
+        "--device", device,
+        "--precision", config.precision,
+        "--shifts", str(config.shifts),
+        "--overlap", str(config.split_overlap),
+        "--tracks-json", str(tracks_json_path),
+    ]
+
+    detail_rows: list[dict[str, Any]] = []
+    init_sec: float | None = None
+    init_error_type = ""
+    init_error_message = ""
+    track_index_by_name = {track.name: idx for idx, track in enumerate(tracks, start=1)}
+    seen_track_names: set[str] = set()
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdin is not None
+    proc.stdin.write(UPSTREAM_WORKER_SOURCE)
+    proc.stdin.close()
+    try:
+        assert proc.stdout is not None
+        for raw_line in proc.stdout:
+            line = raw_line.rstrip("\n")
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                # upstream prints non-JSON status lines; surface them but skip parsing.
+                typer.echo(f"  upstream> {line}")
+                continue
+
+            kind = event.get("event")
+            if kind == "init_complete":
+                init_sec = float(event.get("init_sec", 0.0))
+            elif kind == "init_error":
+                init_error_type = str(event.get("error_type", "InitError"))
+                init_error_message = str(event.get("error_message", ""))
+            elif kind in ("track_complete", "track_error"):
+                track_name = event["track_name"]
+                seen_track_names.add(track_name)
+                track_index = track_index_by_name.get(track_name, 0)
+                detail_row = {
+                    **_detail_row_base(config, chunk_batch_size, seed, device),
+                    "track_index": track_index,
+                    "track_name": track_name,
+                    "track_seed": None,
+                    "elapsed_sec": float(event.get("elapsed_sec", 0.0)),
+                }
+                if kind == "track_complete":
+                    stem_scores = event.get("stem_scores", {})
+                    detail_row["status"] = "ok"
+                    detail_row["error_type"] = ""
+                    detail_row["error_message"] = ""
+                    detail_row["num_scored_stems"] = len(stem_scores)
+                    detail_row["mean_sdr"] = (
+                        statistics.fmean(stem_scores.values())
+                        if stem_scores
+                        else float("nan")
+                    )
+                    for stem_name in REFERENCE_STEMS:
+                        detail_row[f"{stem_name}_sdr"] = stem_scores.get(stem_name)
+                else:
+                    error_type = str(event.get("error_type", ""))
+                    is_oom = (
+                        "out of memory" in event.get("error_message", "").lower()
+                        or error_type in ("OutOfMemoryError", "RuntimeError")
+                        and "out of memory" in event.get("error_message", "").lower()
+                    )
+                    detail_row["status"] = "oom" if is_oom else "error"
+                    detail_row["error_type"] = error_type
+                    detail_row["error_message"] = str(event.get("error_message", ""))
+                    detail_row["num_scored_stems"] = 0
+                    detail_row["mean_sdr"] = float("nan")
+                    for stem_name in REFERENCE_STEMS:
+                        detail_row[f"{stem_name}_sdr"] = None
+                    typer.echo(
+                        f"  {config.config_id} (upstream) track {track_name} "
+                        f"failed: {error_type}: {detail_row['error_message']}"
+                    )
+                detail_rows.append(detail_row)
+            elif kind == "done":
+                break
+        proc.wait()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        tracks_json_path.unlink(missing_ok=True)
+
+    stderr_tail = ""
+    if proc.stderr is not None:
+        stderr_tail = proc.stderr.read() or ""
+
+    # Tracks the worker never reported (e.g., if it died mid-loop).
+    for track in tracks:
+        if track.name in seen_track_names:
+            continue
+        detail_rows.append({
+            **_detail_row_base(config, chunk_batch_size, seed, device),
+            "track_index": track_index_by_name[track.name],
+            "track_name": track.name,
+            "track_seed": None,
+            "elapsed_sec": None,
+            "status": "error",
+            "error_type": init_error_type or "WorkerCrashed",
+            "error_message": init_error_message or stderr_tail[-300:],
+            "num_scored_stems": 0,
+            "mean_sdr": float("nan"),
+            **{f"{stem}_sdr": None for stem in REFERENCE_STEMS},
+        })
+
+    summary_extras = {
+        "model_init_sec": init_sec,
+        "error_type": init_error_type,
+        "error_message": init_error_message
+            or (stderr_tail[-300:] if proc.returncode != 0 else ""),
+    }
+    return detail_rows, summary_extras
+
+
+def _precision_to_dtype(precision: str) -> torch.dtype | None:
+    """
+    Map a CLI precision label to the corresponding ``torch.dtype``.
+
+    :param precision: ``"fp32"`` or ``"fp16"``.
+    :return: ``torch.float16`` for fp16, ``None`` (default float32) for fp32.
+    :raises ValueError: If ``precision`` is anything else.
+    """
+    if precision == "fp32":
+        return None
+    if precision == "fp16":
+        return torch.float16
+    raise ValueError(f"Unsupported precision: {precision}")
+
+
+def _detail_row_base(
+    config: BenchmarkConfig,
+    chunk_batch_size: int | None,
+    base_seed: int | None,
+    device: str,
+) -> dict[str, Any]:
+    """
+    Build the prefix of identifying columns shared by every per-track row
+    in the details CSV.
+
+    :param config: The benchmark config the rows belong to.
+    :param chunk_batch_size: Resolved chunk batch size (None if auto).
+    :param base_seed: Base seed used to derive per-track seeds.
+    :param device: Device string the run executed on.
+    :return: Dict of identifying columns.
+    """
+    return {
+        "config_id": config.config_id,
+        "variant": config.variant,
+        "upstream_version": config.upstream_version,
+        "model": config.model,
+        "precision": config.precision,
+        "device": device,
+        "compile": config.compile,
+        "shifts": config.shifts,
+        "split_overlap": config.split_overlap,
+        "chunk_batch_size": chunk_batch_size,
+        "base_seed": base_seed,
+    }
+
+
+def _summary_row_base(
+    config: BenchmarkConfig,
+    chunk_batch_size: int | None,
+    base_seed: int | None,
+    device: str,
+) -> dict[str, Any]:
+    """
+    Build the prefix of identifying columns shared by every config-level
+    row in the summary CSV.
+
+    :param config: The benchmark config the row belongs to.
+    :param chunk_batch_size: Resolved chunk batch size (None if auto).
+    :param base_seed: Base seed used to derive per-track seeds.
+    :param device: Device string the run executed on.
+    :return: Dict of identifying columns.
+    """
+    return {
+        "config_id": config.config_id,
+        "variant": config.variant,
+        "upstream_version": config.upstream_version,
+        "model": config.model,
+        "precision": config.precision,
+        "device": device,
+        "compile": config.compile,
+        "shifts": config.shifts,
+        "split_overlap": config.split_overlap,
+        "chunk_batch_size": chunk_batch_size,
+        "base_seed": base_seed,
+    }
+
+
+def _resolve_device(device_flag: str | None) -> str:
+    """Pick the actual device string. ``auto`` picks the best available
+    accelerator, falling back to CPU. CPU is also explicitly selectable for
+    portability checks; only FP32 runs there."""
+    if device_flag in (None, "auto"):
+        if torch.cuda.is_available():
+            return "cuda"
+        if torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+    if device_flag == "cuda":
+        if not torch.cuda.is_available():
+            raise typer.BadParameter("CUDA requested but not available.")
+        return "cuda"
+    if device_flag == "mps":
+        if not torch.backends.mps.is_available():
+            raise typer.BadParameter("MPS requested but not available.")
+        return "mps"
+    if device_flag == "cpu":
+        return "cpu"
+    raise typer.BadParameter(
+        f"Unknown --device {device_flag!r}; expected cuda|mps|cpu|auto."
+    )
+
+
+def _empty_cache(device: str) -> None:
+    """
+    Empty the framework allocator cache for the given device, if supported.
+
+    :param device: ``"cuda"``, ``"mps"``, or ``"cpu"``. Anything else is a no-op.
+    """
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    elif device == "mps":
+        if hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+
+
+def _peak_memory_bytes(device: str) -> int | None:
+    """
+    Best-effort peak GPU memory in bytes for the run.
+
+    :param device: Device string to query.
+    :return: Peak allocation in bytes, or ``None`` if the backend does not
+        expose a peak-memory API.
+    """
+    if device == "cuda":
+        return int(torch.cuda.max_memory_allocated())
+    if device == "mps" and hasattr(torch.mps, "driver_allocated_memory"):
+        return int(torch.mps.driver_allocated_memory())
+    return None
+
+
+def _reset_peak_memory(device: str) -> None:
+    """
+    Reset the backend's peak-memory counter so the next ``_peak_memory_bytes``
+    reading reflects only this benchmark config.
+
+    :param device: Device string to reset; only ``"cuda"`` exposes a reset API.
+    """
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+
+
+@app.command()
+def main(
+    musdb_root: Path = typer.Option(
+        ...,
+        "--musdb-root",
+        help="Path to the MUSDB18-HQ split directory containing per-track folders",
+    ),
+    output_dir: Path | None = typer.Option(
+        None,
+        "--output-dir",
+        help="Directory to write benchmark CSV/JSON results into",
+    ),
+    limit: int | None = typer.Option(
+        None,
+        "--limit",
+        min=1,
+        help="Limit benchmarking to the first N tracks",
+    ),
+    seed: int | None = typer.Option(
+        1234,
+        "--seed",
+        help="Base random seed used to derive a deterministic seed per track",
+    ),
+    chunk_batch_size: int | None = typer.Option(
+        None,
+        "--chunk-batch-size",
+        min=1,
+        help="Override how many split chunks are processed per batch",
+    ),
+    models: list[str] = typer.Option(
+        DEFAULT_MODELS,
+        "--model",
+        help="Model(s) to benchmark. Repeat to benchmark multiple models.",
+    ),
+    precisions: list[str] = typer.Option(
+        DEFAULT_PRECISIONS,
+        "--precision",
+        help="Precision mode(s) to benchmark. Repeat to benchmark multiple values.",
+    ),
+    compile_modes: list[bool] = typer.Option(
+        DEFAULT_COMPILE_MODES,
+        "--compile-mode",
+        help="Compilation mode(s) to benchmark. Repeat for false/true.",
+    ),
+    shifts_values: list[int] = typer.Option(
+        DEFAULT_SHIFTS,
+        "--shifts",
+        min=1,
+        help="Shift counts to benchmark. Repeat to benchmark multiple values.",
+    ),
+    split_overlaps: list[float] = typer.Option(
+        DEFAULT_SPLIT_OVERLAPS,
+        "--split-overlap",
+        help="Split overlaps to benchmark. Repeat to benchmark multiple values.",
+    ),
+    device: str | None = typer.Option(
+        None,
+        "--device",
+        help="Device: 'cuda', 'mps', or 'auto' (default: auto). On MPS,"
+             " --compile-mode True is silently dropped (no MPS support yet).",
+    ),
+    include_upstream: bool = typer.Option(
+        False,
+        "--include-upstream",
+        help="Also benchmark the upstream PyPI demucs release in an isolated venv.",
+    ),
+    upstream_version: str = typer.Option(
+        DEFAULT_UPSTREAM_VERSION,
+        "--upstream-version",
+        help=(
+            "Git ref (branch, tag, or commit SHA) of adefossez/demucs to install "
+            "for the comparison. Defaults to 'main'."
+        ),
+    ),
+    upstream_python: str = typer.Option(
+        DEFAULT_UPSTREAM_PYTHON,
+        "--upstream-python",
+        help="Python interpreter version to use for the upstream venv.",
+    ),
+) -> None:
+    """
+    Benchmark the MUSDB matrix on the chosen device and record SDR + timing.
+    """
+    device = _resolve_device(device)
+    # ``compile`` is CUDA-only (Inductor codegen errors on MPS for HTDemucs;
+    # CPU compile path is not exercised here).
+    if device != "cuda" and any(compile_modes):
+        typer.echo(
+            f"Note: device={device}; dropping compile=True from the matrix "
+            f"(torch.compile is unsupported here)."
+        )
+        compile_modes = [c for c in compile_modes if not c]
+        if not compile_modes:
+            compile_modes = [False]
+    # FP16 is rejected on CPU by ``api.py`` (no faster path in PyTorch).
+    if device == "cpu" and "fp16" in precisions:
+        dropped = [p for p in precisions if p == "fp16"]
+        if dropped:
+            typer.echo(
+                f"Note: device=cpu; dropping {dropped} from the matrix "
+                f"(FP16 is not supported on CPU)."
+            )
+        precisions = [p for p in precisions if p != "fp16"]
+        if not precisions:
+            precisions = ["fp32"]
+
+    tracks = _discover_tracks(musdb_root)
+    if limit is not None:
+        tracks = tracks[:limit]
+
+    configs = _build_configs(
+        models=models,
+        precisions=precisions,
+        compile_modes=compile_modes,
+        shifts_values=shifts_values,
+        split_overlaps=split_overlaps,
+        include_upstream=include_upstream,
+        upstream_version=upstream_version,
+    )
+
+    if include_upstream:
+        # Provision the upstream venv up-front so that errors surface before any
+        # local runs eat into wall-clock time.
+        try:
+            _ensure_upstream_venv(upstream_version, upstream_python)
+        except subprocess.CalledProcessError as exc:
+            raise typer.BadParameter(
+                f"Failed to set up upstream demucs venv (version={upstream_version}, "
+                f"python={upstream_python}): {exc}"
+            )
+
+    if output_dir is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = Path("benchmarks") / "musdb" / timestamp
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    typer.echo(f"Benchmarking {len(configs)} configs across {len(tracks)} MUSDB tracks")
+    typer.echo(f"Results directory: {output_dir}")
+
+    details_rows: list[dict[str, Any]] = []
+    summary_rows: list[dict[str, Any]] = []
+
+    for config_index, config in enumerate(configs, start=1):
+        variant_label = (
+            f"upstream-{config.upstream_version}" if config.variant == "upstream" else "local"
+        )
+        label = (
+            f"[{config_index}/{len(configs)}] {config.config_id} variant={variant_label} "
+            f"model={config.model} precision={config.precision} "
+            f"compile={config.compile} shifts={config.shifts} "
+            f"split_overlap={config.split_overlap}"
+        )
+        typer.echo(label)
+
+        if config.variant == "upstream":
+            upstream_details, upstream_extras = _run_upstream_config(
+                config=config,
+                tracks=tracks,
+                device=device,
+                seed=seed,
+                chunk_batch_size=chunk_batch_size,
+                output_dir=output_dir,
+                upstream_python_version=upstream_python,
+            )
+            details_rows.extend(upstream_details)
+            ok_rows = [row for row in upstream_details if row.get("status") == "ok"]
+            ok_elapsed = [
+                float(row["elapsed_sec"])
+                for row in ok_rows
+                if row.get("elapsed_sec") is not None
+            ]
+            remaining_elapsed = ok_elapsed[1:]
+            error_count = sum(1 for row in upstream_details if row.get("status") == "error")
+            oom_count = sum(1 for row in upstream_details if row.get("status") == "oom")
+            attempted_elapsed = [
+                float(row["elapsed_sec"])
+                for row in upstream_details
+                if row.get("elapsed_sec") is not None
+            ]
+            mean_sdr_values = [
+                float(row["mean_sdr"])
+                for row in ok_rows
+                if not math.isnan(float(row["mean_sdr"]))
+            ]
+            per_stem_summary: dict[str, float] = {}
+            for stem_name in REFERENCE_STEMS:
+                stem_values = [
+                    float(row[f"{stem_name}_sdr"])
+                    for row in ok_rows
+                    if row.get(f"{stem_name}_sdr") is not None
+                    and not math.isnan(float(row[f"{stem_name}_sdr"]))
+                ]
+                per_stem_summary[stem_name] = (
+                    statistics.fmean(stem_values) if stem_values else float("nan")
+                )
+
+            summary_rows.append(
+                {
+                    **_summary_row_base(config, chunk_batch_size, seed, device),
+                    "status": "ok" if len(ok_rows) == len(tracks) else "partial",
+                    "error_type": upstream_extras.get("error_type", ""),
+                    "error_message": upstream_extras.get("error_message", ""),
+                    "num_tracks": len(tracks),
+                    "ok_tracks": len(ok_rows),
+                    "error_tracks": error_count,
+                    "oom_tracks": oom_count,
+                    "model_init_sec": upstream_extras.get("model_init_sec"),
+                    "first_attempt_sec": (
+                        float(upstream_details[0]["elapsed_sec"])
+                        if upstream_details and upstream_details[0].get("elapsed_sec") is not None
+                        else None
+                    ),
+                    "first_attempt_status": (
+                        str(upstream_details[0].get("status", ""))
+                        if upstream_details else ""
+                    ),
+                    "first_track_sec": ok_elapsed[0] if ok_elapsed else None,
+                    "remaining_total_sec": sum(remaining_elapsed) if remaining_elapsed else 0.0,
+                    "steady_state_mean_sec": (
+                        statistics.fmean(remaining_elapsed) if remaining_elapsed else None
+                    ),
+                    "steady_state_median_sec": (
+                        statistics.median(remaining_elapsed) if remaining_elapsed else None
+                    ),
+                    "attempted_track_sec": sum(attempted_elapsed),
+                    "track_total_sec": sum(ok_elapsed),
+                    "mean_sdr": (
+                        statistics.fmean(mean_sdr_values) if mean_sdr_values else float("nan")
+                    ),
+                    "median_sdr": (
+                        statistics.median(mean_sdr_values) if mean_sdr_values else float("nan")
+                    ),
+                    "peak_vram_mb": None,
+                    **{f"{stem}_mean_sdr": value for stem, value in per_stem_summary.items()},
+                }
+            )
+            continue
+
+        if not ensure_model_available(config.model):
+            summary_rows.append(
+                {
+                    **_summary_row_base(config, chunk_batch_size, seed, device),
+                    "status": "model_unavailable",
+                    "error_type": "ModelUnavailable",
+                    "error_message": f"Could not download or load model '{config.model}'",
+                    "num_tracks": len(tracks),
+                }
+            )
+            continue
+
+        init_started_at = perf_counter()
+        try:
+            separator = Separator(
+                model=config.model,
+                device=device,
+                dtype=_precision_to_dtype(config.precision),
+                compile=config.compile,
+            )
+        except Exception as error:
+            summary_rows.append(
+                {
+                    **_summary_row_base(config, chunk_batch_size, seed, device),
+                    "status": "error",
+                    "error_type": type(error).__name__,
+                    "error_message": str(error),
+                    "num_tracks": len(tracks),
+                    "model_init_sec": perf_counter() - init_started_at,
+                }
+            )
+            typer.echo(f"Failed to initialize {config.config_id}: {error}")
+            continue
+
+        model_init_sec = perf_counter() - init_started_at
+        _empty_cache(device)
+        _reset_peak_memory(device)
+        peak_vram_bytes = 0
+
+        successful_track_rows: list[dict[str, Any]] = []
+        error_count = 0
+        oom_count = 0
+        config_error_type = ""
+        config_error_message = ""
+
+        for track_index, track in enumerate(tracks, start=1):
+            detail_row = {
+                **_detail_row_base(config, chunk_batch_size, seed, device),
+                "track_index": track_index,
+                "track_name": track.name,
+                "track_seed": None if seed is None else _build_track_seed(seed, track.name),
+            }
+
+            started_at = perf_counter()
+            try:
+                separated = separator.separate(
+                    audio=track.mixture_path,
+                    shifts=config.shifts,
+                    split_overlap=config.split_overlap,
+                    seed=detail_row["track_seed"],
+                    chunk_batch_size=chunk_batch_size,
+                )
+                elapsed_sec = perf_counter() - started_at
+                detail_row["elapsed_sec"] = elapsed_sec
+
+                stem_scores: dict[str, float] = {}
+                for stem_name in track.reference_stems:
+                    if stem_name not in separated.sources:
+                        continue
+                    reference = separator._to_tensor(track.directory / f"{stem_name}.wav")
+                    stem_scores[stem_name] = _compute_sdr(
+                        separated.sources[stem_name],
+                        reference,
+                    )
+
+                detail_row["status"] = "ok"
+                detail_row["error_type"] = ""
+                detail_row["error_message"] = ""
+                detail_row["num_scored_stems"] = len(stem_scores)
+                detail_row["mean_sdr"] = (
+                    statistics.fmean(stem_scores.values()) if stem_scores else float("nan")
+                )
+                for stem_name in REFERENCE_STEMS:
+                    detail_row[f"{stem_name}_sdr"] = stem_scores.get(stem_name)
+
+                successful_track_rows.append(detail_row)
+                details_rows.append(detail_row)
+            except Exception as error:
+                elapsed_sec = perf_counter() - started_at
+                error_type = type(error).__name__
+                is_oom = isinstance(error, torch.OutOfMemoryError) or (
+                    "out of memory" in str(error).lower()
+                )
+
+                detail_row["elapsed_sec"] = elapsed_sec
+                detail_row["status"] = "oom" if is_oom else "error"
+                detail_row["error_type"] = error_type
+                detail_row["error_message"] = str(error)
+                detail_row["num_scored_stems"] = 0
+                detail_row["mean_sdr"] = float("nan")
+                for stem_name in REFERENCE_STEMS:
+                    detail_row[f"{stem_name}_sdr"] = None
+
+                details_rows.append(detail_row)
+                if is_oom:
+                    oom_count += 1
+                else:
+                    error_count += 1
+
+                typer.echo(
+                    f"{config.config_id} track {track.name} failed with "
+                    f"{detail_row['status']}: {error_type}: {error}"
+                )
+                traceback.print_exc()
+                _empty_cache(device)
+
+            measured_peak = _peak_memory_bytes(device)
+            if measured_peak is not None:
+                peak_vram_bytes = max(peak_vram_bytes, measured_peak)
+
+        config_detail_rows = [
+            row for row in details_rows if row["config_id"] == config.config_id
+        ]
+        ok_rows = [row for row in successful_track_rows if row["status"] == "ok"]
+        ok_elapsed = [float(row["elapsed_sec"]) for row in ok_rows]
+        remaining_elapsed = ok_elapsed[1:]
+        attempted_elapsed = [
+            float(row["elapsed_sec"])
+            for row in config_detail_rows
+            if row.get("elapsed_sec") is not None
+        ]
+        mean_sdr_values = [
+            float(row["mean_sdr"])
+            for row in ok_rows
+            if not math.isnan(float(row["mean_sdr"]))
+        ]
+
+        per_stem_summary: dict[str, float] = {}
+        for stem_name in REFERENCE_STEMS:
+            stem_values = [
+                float(row[f"{stem_name}_sdr"])
+                for row in ok_rows
+                if row.get(f"{stem_name}_sdr") is not None
+                and not math.isnan(float(row[f"{stem_name}_sdr"]))
+            ]
+            per_stem_summary[stem_name] = (
+                statistics.fmean(stem_values) if stem_values else float("nan")
+            )
+
+        summary_rows.append(
+            {
+                **_summary_row_base(config, chunk_batch_size, seed, device),
+                "status": "ok" if len(ok_rows) == len(tracks) else "partial",
+                "error_type": config_error_type,
+                "error_message": config_error_message,
+                "num_tracks": len(tracks),
+                "ok_tracks": len(ok_rows),
+                "error_tracks": error_count,
+                "oom_tracks": oom_count,
+                "model_init_sec": model_init_sec,
+                "first_attempt_sec": (
+                    float(config_detail_rows[0]["elapsed_sec"]) if config_detail_rows else None
+                ),
+                "first_attempt_status": (
+                    str(config_detail_rows[0]["status"]) if config_detail_rows else ""
+                ),
+                "first_track_sec": ok_elapsed[0] if ok_elapsed else None,
+                "remaining_total_sec": sum(remaining_elapsed) if remaining_elapsed else 0.0,
+                "steady_state_mean_sec": (
+                    statistics.fmean(remaining_elapsed) if remaining_elapsed else None
+                ),
+                "steady_state_median_sec": (
+                    statistics.median(remaining_elapsed) if remaining_elapsed else None
+                ),
+                "attempted_track_sec": sum(attempted_elapsed),
+                "track_total_sec": sum(ok_elapsed),
+                "mean_sdr": (
+                    statistics.fmean(mean_sdr_values) if mean_sdr_values else float("nan")
+                ),
+                "median_sdr": (
+                    statistics.median(mean_sdr_values) if mean_sdr_values else float("nan")
+                ),
+                "peak_vram_mb": peak_vram_bytes / (1024 * 1024) if peak_vram_bytes else None,
+                **{f"{stem}_mean_sdr": value for stem, value in per_stem_summary.items()},
+            }
+        )
+
+        del separator
+        gc.collect()
+        _empty_cache(device)
+
+    detail_csv = output_dir / "benchmark_details.csv"
+    summary_csv = output_dir / "benchmark_summary.csv"
+    metadata_json = output_dir / "benchmark_metadata.json"
+
+    detail_fieldnames = [
+        "config_id",
+        "variant",
+        "upstream_version",
+        "model",
+        "precision",
+        "device",
+        "compile",
+        "shifts",
+        "split_overlap",
+        "chunk_batch_size",
+        "base_seed",
+        "track_index",
+        "track_name",
+        "track_seed",
+        "status",
+        "error_type",
+        "error_message",
+        "elapsed_sec",
+        "num_scored_stems",
+        "mean_sdr",
+        *[f"{stem}_sdr" for stem in REFERENCE_STEMS],
+    ]
+    with open(detail_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=detail_fieldnames)
+        writer.writeheader()
+        for row in details_rows:
+            writer.writerow(
+                {
+                    key: _format_float(value) if isinstance(value, float) else value
+                    for key, value in row.items()
+                }
+            )
+
+    summary_fieldnames = [
+        "config_id",
+        "variant",
+        "upstream_version",
+        "model",
+        "precision",
+        "device",
+        "compile",
+        "shifts",
+        "split_overlap",
+        "chunk_batch_size",
+        "base_seed",
+        "status",
+        "error_type",
+        "error_message",
+        "num_tracks",
+        "ok_tracks",
+        "error_tracks",
+        "oom_tracks",
+        "model_init_sec",
+        "first_attempt_sec",
+        "first_attempt_status",
+        "first_track_sec",
+        "remaining_total_sec",
+        "steady_state_mean_sec",
+        "steady_state_median_sec",
+        "attempted_track_sec",
+        "track_total_sec",
+        "peak_vram_mb",
+        "mean_sdr",
+        "median_sdr",
+        *[f"{stem}_mean_sdr" for stem in REFERENCE_STEMS],
+    ]
+    with open(summary_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=summary_fieldnames)
+        writer.writeheader()
+        for row in summary_rows:
+            writer.writerow(
+                {
+                    key: _format_float(value) if isinstance(value, float) else value
+                    for key, value in row.items()
+                }
+            )
+
+    metadata = {
+        "musdb_root": str(musdb_root),
+        "output_dir": str(output_dir),
+        "device": device,
+        "models": models,
+        "precisions": precisions,
+        "compile_modes": compile_modes,
+        "shifts": shifts_values,
+        "split_overlaps": split_overlaps,
+        "seed": seed,
+        "limit": limit,
+        "num_tracks": len(tracks),
+        "num_configs": len(configs),
+        "include_upstream": include_upstream,
+        "upstream_version": upstream_version if include_upstream else None,
+        "upstream_python": upstream_python if include_upstream else None,
+        "detail_csv": str(detail_csv),
+        "summary_csv": str(summary_csv),
+    }
+    metadata_json.write_text(json.dumps(metadata, indent=2))
+
+    typer.echo(f"Wrote details: {detail_csv}")
+    typer.echo(f"Wrote summary: {summary_csv}")
+    typer.echo(f"Wrote metadata: {metadata_json}")
+
+
+if __name__ == "__main__":
+    app()

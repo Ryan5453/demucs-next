@@ -39,6 +39,9 @@ build-backend = "uv_build"
 module-name = "demucs"
 module-root = ""
 
+source-include = ["demucs/metal/*.metal"]
+wheel-include = ["demucs/metal/*.metal"]
+
 [tool.ruff.lint]
 extend-select = ["I"]
 

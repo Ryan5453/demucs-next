@@ -74,17 +74,8 @@ class Predictor(BasePredictor):
             ge=1,
             le=20,
         ),
-        split: bool = Input(
-            description="Split audio into chunks to save memory",
-            default=True,
-        ),
-        split_size: int | None = Input(
-            description="Size of each chunk in seconds, smaller values use less GPU memory but process slower",
-            default=None,
-            ge=1,
-        ),
         split_overlap: float = Input(
-            description="Overlap between split chunks, higher values improve quality at chunk boundaries",
+            description="Overlap between segments; higher values improve quality at segment boundaries",
             default=0.25,
             ge=0.0,
             lt=1.0,
@@ -103,9 +94,7 @@ class Predictor(BasePredictor):
         :param format: Output audio format
         :param isolate_stem: Stem to isolate, or "none" for all stems
         :param shifts: Number of random shifts for equivariant stabilization
-        :param split: Whether to split audio into chunks
-        :param split_size: Chunk size in seconds
-        :param split_overlap: Overlap between chunks
+        :param split_overlap: Overlap between segments
         :param clip_mode: Clipping prevention strategy
         :return: Output object with separated audio stems
         """
@@ -119,8 +108,6 @@ class Predictor(BasePredictor):
             separated = separator.separate(
                 audio=audio,
                 shifts=shifts,
-                split=split,
-                split_size=split_size,
                 split_overlap=split_overlap,
                 use_only_stem=isolate_stem,
             )
@@ -129,8 +116,6 @@ class Predictor(BasePredictor):
             separated = separator.separate(
                 audio=audio,
                 shifts=shifts,
-                split=split,
-                split_size=split_size,
                 split_overlap=split_overlap,
             )
 

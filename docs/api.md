@@ -21,7 +21,7 @@ A `Separator` takes the following parameters:
 - `model` - The model to use for separation. While just passing in a string is the easiest, you can use `ModelRepository` to load models manually and then pass them in.
 - `device` - The device/backend to use for loading and running the model. Demucs can usually auto-detect the best backend to use based on the availability of the hardware using the heuristic above.
 - `only_load` - Optional, if specified, load only the specialized model for this stem (only applicable to bag-of-models like htdemucs_ft).
-- `dtype` - Optional, set to `torch.float16` for half-precision inference on CUDA. If `None`, uses default float32.
+- `dtype` - Optional, set to `torch.float16` for half-precision inference. Supported only on CUDA and MPS. If `None`, uses default float32.
 - `compile` - Optional, if `True`, compiles the core of the HTDemucs neural network on CUDA. This will significantly improve the performance of the model at the cost of a significant warmup cost. 
 
 ### Attributes
@@ -46,8 +46,6 @@ def separate(
     self,
     audio: tuple[Tensor, int] | Path | str | bytes,
     shifts: int = 1,
-    split: bool = True,
-    split_size: int | None = None,
     split_overlap: float = 0.25,
     seed: int | None = None,
     progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
@@ -60,13 +58,13 @@ When separating audio, you have the ability to specify the following parameters:
 
 - `audio` - The audio to separate. Can be a tuple of (Tensor, sample_rate), a file path, or raw audio bytes.
 - `shifts` - The number of random shifts for equivariant stabilization. In simple terms, this is a technique to make the model more robust to small changes in the audio, such as small shifts in time or pitch. More shifts mean generally higher quality separation but also longer processing time.
-- `split` - Whether to split the audio into chunks.
-- `split_size` - The size of each chunk in seconds.
-- `split_overlap` - The overlap between split chunks. Must be in the range `[0.0, 1.0)`.
+- `split_overlap` - The overlap between consecutive segments. Must be in the range `[0.0, 1.0)`. Higher values smooth segment boundaries at the cost of more compute per track.
 - `seed` - Optional random seed for reproducible shift-based inference. This is especially useful when benchmarking configurations that use `shifts > 1`.
 - `progress_callback` - A callback function to receive progress updates. View the [Progress Callbacks](#progress-callbacks) section for more information.
 - `use_only_stem` - If specified, perform the separation using only the specialized model for this stem. In most cases you should use `only_load` when creating the `Separator` instance instead of this.
-- `chunk_batch_size` - Number of split chunks to process in parallel. Defaults to `4` on CUDA and `1` on CPU/MPS.
+- `chunk_batch_size` - Number of segments to process in parallel. Defaults to `4` on CUDA, `2` on MPS (kernel-launch amortization on Apple Silicon's unified memory; degrades past 2), and `1` on CPU.
+
+The model's training segment length (`max_allowed_segment * samplerate`, e.g. 7.8s for HTDemucs) is used internally for every chunk; it isn't a knob because there's no useful range — shorter chunks get padded back up to that length before inference (so they're strictly slower without quality benefit) and longer chunks would extrapolate the cross-transformer's positional embeddings past their training range (degrading quality).
 
 Example:
 
@@ -74,8 +72,6 @@ Example:
 sources = separator.separate(
     "mixture.wav",
     shifts=4,
-    split=True,
-    split_size=20,
     split_overlap=0.25,
     seed=1234,
 )
@@ -249,15 +245,15 @@ When using `ModelRepository.get_model` (or creating a `Separator` which calls it
 
 ### Audio Separation
 
-When using `Separator.separate`, the callback receives the following events (only if `split=True`):
+When using `Separator.separate`, the callback receives the following events:
 
-- `processing_start`: Fired before processing chunks.
-  - `total_chunks`: Total number of chunks to process.
-- `chunk_complete`: Fired after each chunk is processed.
-  - `completed_chunks`: Number of chunks completed so far.
-  - `total_chunks`: Total number of chunks.
-- `processing_complete`: Fired after all chunks are processed.
-  - `total_chunks`: Total number of chunks.
+- `processing_start`: Fired before processing segments.
+  - `total_chunks`: Total number of segments to process.
+- `chunk_complete`: Fired after each segment is processed.
+  - `completed_chunks`: Number of segments completed so far.
+  - `total_chunks`: Total number of segments.
+- `processing_complete`: Fired after all segments are processed.
+  - `total_chunks`: Total number of segments.
 
 ## Version
 

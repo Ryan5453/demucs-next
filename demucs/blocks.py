@@ -54,6 +54,27 @@ def center_trim(tensor: Tensor, reference: Tensor | int) -> Tensor:
     return tensor
 
 
+_HANN_CACHE: dict[tuple[int, torch.device, torch.dtype], Tensor] = {}
+
+
+def _hann_window(size: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+    """
+    Return a cached Hann window — ``torch.hann_window`` allocates fresh
+    on every call, which adds up inside the STFT hot loop.
+
+    :param size: Window length in samples.
+    :param device: Device to allocate the window on.
+    :param dtype: Dtype of the window.
+    :return: 1-D Hann window tensor of length ``size``.
+    """
+    key = (size, device, dtype)
+    win = _HANN_CACHE.get(key)
+    if win is None:
+        win = torch.hann_window(size, device=device, dtype=dtype)
+        _HANN_CACHE[key] = win
+    return win
+
+
 def spectro(x: Tensor, n_fft: int = 512, hop_length: int | None = None, pad: int = 0) -> Tensor:
     """Compute the STFT of the input signal.
 
@@ -66,11 +87,12 @@ def spectro(x: Tensor, n_fft: int = 512, hop_length: int | None = None, pad: int
     *other, length = x.shape
     x = x.reshape(-1, length)
 
+    win_dtype = x.dtype if x.dtype.is_floating_point else torch.float32
     z = torch.stft(
         x,
         n_fft * (1 + pad),
         hop_length or n_fft // 4,
-        window=torch.hann_window(n_fft).to(x),
+        window=_hann_window(n_fft, x.device, win_dtype),
         win_length=n_fft,
         normalized=True,
         center=True,
@@ -79,6 +101,60 @@ def spectro(x: Tensor, n_fft: int = 512, hop_length: int | None = None, pad: int
     )
     _, freqs, frame = z.shape
     return z.view(*other, freqs, frame)
+
+
+def _istft_fold(
+    z: Tensor,
+    n_fft: int,
+    hop_length: int,
+    win_length: int,
+    window: Tensor,
+    length: int | None,
+) -> Tensor:
+    """
+    Custom centered, normalized=True iSTFT that bypasses ``torch.istft``'s
+    NOLA check (which calls ``.item()`` and forces a device→host sync on
+    MPS — see PyTorch issue #94718).
+
+    :param z: Complex spectrogram of shape ``[B, freqs, frames]``.
+    :param n_fft: FFT size.
+    :param hop_length: Hop length between frames.
+    :param win_length: Window length (must be ``<= n_fft``).
+    :param window: Window tensor of length ``win_length``.
+    :param length: Optional output length to trim/pad to.
+    :return: Reconstructed signal of shape ``[B, L]``.
+    """
+    n_frames = z.shape[-1]
+    frames = torch.fft.irfft(z, n=n_fft, dim=1)  # [B, n_fft, n_frames]
+
+    if win_length < n_fft:
+        pad_total = n_fft - win_length
+        pad_left = pad_total // 2
+        window = functional.pad(window, (pad_left, pad_total - pad_left))
+    frames = frames * window[None, :, None]
+
+    output_length = (n_frames - 1) * hop_length + n_fft
+    out = functional.fold(
+        frames,
+        output_size=(output_length, 1),
+        kernel_size=(n_fft, 1),
+        stride=(hop_length, 1),
+    ).squeeze(-1).squeeze(1)
+
+    win_sq_frames = (window * window)[None, :, None].expand(1, n_fft, n_frames)
+    norm = functional.fold(
+        win_sq_frames,
+        output_size=(output_length, 1),
+        kernel_size=(n_fft, 1),
+        stride=(hop_length, 1),
+    ).squeeze(-1).squeeze(1)
+    out = out / norm
+
+    if length is None:
+        out = out[..., n_fft // 2 : -(n_fft // 2)]
+    else:
+        out = out[..., n_fft // 2 : n_fft // 2 + length]
+    return out * (n_fft ** 0.5)
 
 
 def ispectro(z: Tensor, hop_length: int | None = None, length: int | None = None, pad: int = 0) -> Tensor:
@@ -95,18 +171,29 @@ def ispectro(z: Tensor, hop_length: int | None = None, length: int | None = None
     z = z.view(-1, freqs, frames)
     win_length = n_fft // (1 + pad)
 
-    x = torch.istft(
-        z,
-        n_fft,
-        hop_length,
-        window=torch.hann_window(win_length).to(z.real),
-        win_length=win_length,
-        normalized=True,
-        length=length,
-        center=True,
-    )
-    _, length = x.shape
-    return x.view(*other, length)
+    if z.device.type == "mps":
+        # Avoid torch.istft's NOLA-check host sync on MPS (issue #94718).
+        x = _istft_fold(
+            z,
+            n_fft=n_fft,
+            hop_length=hop_length if hop_length is not None else n_fft // 4,
+            win_length=win_length,
+            window=_hann_window(win_length, z.real.device, z.real.dtype),
+            length=length,
+        )
+    else:
+        x = torch.istft(
+            z,
+            n_fft,
+            hop_length,
+            window=_hann_window(win_length, z.real.device, z.real.dtype),
+            win_length=win_length,
+            normalized=True,
+            length=length,
+            center=True,
+        )
+    _, output_length = x.shape
+    return x.view(*other, output_length)
 
 
 class BLSTM(nn.Module):
@@ -391,7 +478,6 @@ def pad1d(
     :param value: Fill value for constant padding
     :return: Padded tensor
     """
-    x0 = x
     length = x.shape[-1]
     padding_left, padding_right = paddings
     if mode == "reflect":
@@ -403,8 +489,10 @@ def pad1d(
             paddings = (padding_left - extra_pad_left, padding_right - extra_pad_right)
             x = functional.pad(x, (extra_pad_left, extra_pad_right))
     out = functional.pad(x, paddings, mode, value)
+    # Shape-only check kept; the prior elementwise `(out[...] == x0).all()`
+    # assertion forced a host-side sync on every STFT call inside the chunk
+    # loop, with no functional benefit on a well-tested PyTorch primitive.
     assert out.shape[-1] == length + padding_left + padding_right
-    assert (out[..., padding_left : padding_left + length] == x0).all()
     return out
 
 

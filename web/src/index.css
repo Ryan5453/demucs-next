@@ -1146,3 +1146,238 @@ html, body {
 .animate-slide-up {
   animation: slide-up 0.4s cubic-bezier(0.4, 0, 0.2, 1) forwards;
 }
+
+/* -------------------------------------------------------------------- */
+/* /benchmark page                                                       */
+/* -------------------------------------------------------------------- */
+
+.bench-field-label {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #888;
+}
+
+.bench-input,
+.bench-select {
+    background: #0f0f0f;
+    border: 1px solid #2a2a2a;
+    color: #e6e6e6;
+    border-radius: 6px;
+    padding: 0.5rem 0.75rem;
+    font-family: var(--font-sans);
+    font-size: 0.875rem;
+    appearance: none;
+    -webkit-appearance: none;
+}
+
+.bench-input:focus,
+.bench-select:focus {
+    outline: none;
+    border-color: var(--accent);
+    background: #131313;
+}
+
+.bench-input:disabled,
+.bench-select:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.bench-readonly {
+    background: #0a0a0a;
+    border: 1px solid #1a1a1a;
+    color: #aaa;
+    border-radius: 6px;
+    padding: 0.5rem 0.75rem;
+    font-family: var(--font-mono);
+    font-size: 0.875rem;
+}
+
+.bench-dropzone {
+    border: 2px dashed #2a2a2a;
+    background: #0a0a0a;
+    border-radius: 10px;
+    padding: 2rem;
+    text-align: center;
+    transition: border-color 0.15s ease, background 0.15s ease;
+    color: #aaa;
+    font-size: 0.875rem;
+}
+
+.bench-dropzone:hover {
+    border-color: #3a3a3a;
+    background: #0c0c0c;
+}
+
+.bench-dropzone.is-loaded {
+    border-color: rgba(201, 162, 39, 0.4);
+    border-style: solid;
+    background: rgba(201, 162, 39, 0.04);
+    color: #d6d6d6;
+}
+
+.bench-dropzone.is-loaded:hover {
+    border-color: rgba(201, 162, 39, 0.6);
+    background: rgba(201, 162, 39, 0.07);
+}
+
+.bench-dropzone-check {
+    color: var(--accent);
+    font-weight: 700;
+    margin-right: 0.25rem;
+}
+
+.bench-btn {
+    font-family: var(--font-sans);
+    font-size: 0.875rem;
+    font-weight: 600;
+    padding: 0.5rem 1.1rem;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+}
+
+.bench-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.bench-btn-primary {
+    background: var(--accent);
+    color: #1a1300;
+}
+
+.bench-btn-primary:hover:not(:disabled) {
+    background: var(--accent-light);
+}
+
+.bench-btn-secondary {
+    background: #1a1a1a;
+    border-color: #2a2a2a;
+    color: #d6d6d6;
+}
+
+.bench-btn-secondary:hover:not(:disabled) {
+    background: #222;
+    border-color: #3a3a3a;
+}
+
+.bench-btn-danger {
+    background: #401414;
+    border-color: #5a1c1c;
+    color: #f5b8b8;
+}
+
+.bench-btn-danger:hover:not(:disabled) {
+    background: #4a1818;
+}
+
+.bench-btn-success {
+    background: #133018;
+    border-color: #1d4a26;
+    color: #a8e6b6;
+}
+
+.bench-btn-success:hover:not(:disabled) {
+    background: #173820;
+}
+
+.bench-banner {
+    background: rgba(201, 162, 39, 0.08);
+    border: 1px solid rgba(201, 162, 39, 0.25);
+    color: #d8c47a;
+    padding: 0.75rem 1rem;
+    border-radius: 6px;
+    font-size: 0.875rem;
+}
+
+.bench-error {
+    background: rgba(180, 50, 50, 0.12);
+    border: 1px solid rgba(180, 50, 50, 0.35);
+    color: #f0a8a8;
+    padding: 0.75rem 1rem;
+    border-radius: 6px;
+    font-size: 0.875rem;
+}
+
+.bench-stat {
+    background: #0a0a0a;
+    border: 1px solid #1a1a1a;
+    border-radius: 8px;
+    padding: 0.75rem 1rem;
+}
+
+.bench-stat-label {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #888;
+}
+
+.bench-stat-value {
+    font-family: var(--font-sans);
+    font-size: 1.125rem;
+    font-weight: 600;
+    color: #e6e6e6;
+    margin-top: 0.25rem;
+}
+
+.bench-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--font-mono);
+    font-size: 0.8125rem;
+    color: #d6d6d6;
+}
+
+.bench-table thead {
+    background: #0a0a0a;
+    color: #888;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+
+.bench-table th,
+.bench-table td {
+    border-bottom: 1px solid #1a1a1a;
+    padding: 0.5rem 0.75rem;
+    text-align: right;
+    white-space: nowrap;
+}
+
+.bench-table th:first-child,
+.bench-table td:first-child {
+    text-align: left;
+}
+
+.bench-table tbody tr:hover {
+    background: #0d0d0d;
+}
+
+.bench-table tr.has-error {
+    background: rgba(180, 50, 50, 0.08);
+}
+
+.bench-table tr.has-error td {
+    color: #f0a8a8;
+}
+
+.bench-logs {
+    background: #060606;
+    border: 1px solid #1a1a1a;
+    border-radius: 6px;
+    color: #888;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    padding: 0.75rem;
+    max-height: 24rem;
+    overflow-y: auto;
+}
