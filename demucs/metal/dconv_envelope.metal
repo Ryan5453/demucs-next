@@ -10,17 +10,22 @@
 //   output = residual + layer_scale * glu(group_norm(z))
 // which replaces FOUR previously separate kernel launches (group_norm,
 // glu, layerscale mul, residual add) with one. Used per DConv sub-layer.
-// Auto-organized for demucs-next FP16 inference on MPS.
+// Same source compiles for FP16 (half) and BF16 (bfloat) — the Python side
+// prepends ``#define SCALAR_T bfloat`` to switch.
 // See ``demucs/metal/__init__.py`` for the Python-side wrappers.
 
 #include <metal_stdlib>
 using namespace metal;
 
+#ifndef SCALAR_T
+#define SCALAR_T half
+#endif
+
 kernel void glu_layerscale_resid_fp16(
-    device half*       out         [[buffer(0)]],   // (B, C, N)
-    device const half* z           [[buffer(1)]],   // (B, 2C, N)
-    device const half* residual    [[buffer(2)]],   // (B, C, N)
-    device const half* layer_scale [[buffer(3)]],   // (C,)
+    device SCALAR_T*       out         [[buffer(0)]],   // (B, C, N)
+    device const SCALAR_T* z           [[buffer(1)]],   // (B, 2C, N)
+    device const SCALAR_T* residual    [[buffer(2)]],   // (B, C, N)
+    device const SCALAR_T* layer_scale [[buffer(3)]],   // (C,)
     constant uint&     C           [[buffer(4)]],
     constant uint&     N           [[buffer(5)]],
     uint b   [[threadgroup_position_in_grid]],
@@ -29,9 +34,9 @@ kernel void glu_layerscale_resid_fp16(
 ) {
     uint total_z = 2 * C * N;
     uint total_o = C * N;
-    device const half* z_b = z + b * total_z;
-    device const half* r_b = residual + b * total_o;
-    device half*       o_b = out + b * total_o;
+    device const SCALAR_T* z_b = z + b * total_z;
+    device const SCALAR_T* r_b = residual + b * total_o;
+    device SCALAR_T*       o_b = out + b * total_o;
 
     for (uint i = tid; i < total_o; i += tgs) {
         uint c = i / N;
@@ -41,17 +46,17 @@ kernel void glu_layerscale_resid_fp16(
         float sig = 1.0f / (1.0f + exp(-b_val));
         float ls = float(layer_scale[c]);
         float resid = float(r_b[i]);
-        o_b[i] = half(a * sig * ls + resid);
+        o_b[i] = SCALAR_T(a * sig * ls + resid);
     }
 }
 
 kernel void norm_glu_ls_resid_fp16(
-    device half*       out          [[buffer(0)]],   // (B, C, N)
-    device const half* z            [[buffer(1)]],   // (B, 2C, N)
-    device const half* residual     [[buffer(2)]],   // (B, C, N)
-    device const half* nweight      [[buffer(3)]],   // (2C,)
-    device const half* nbias        [[buffer(4)]],   // (2C,)
-    device const half* layer_scale  [[buffer(5)]],   // (C,)
+    device SCALAR_T*       out          [[buffer(0)]],   // (B, C, N)
+    device const SCALAR_T* z            [[buffer(1)]],   // (B, 2C, N)
+    device const SCALAR_T* residual     [[buffer(2)]],   // (B, C, N)
+    device const SCALAR_T* nweight      [[buffer(3)]],   // (2C,)
+    device const SCALAR_T* nbias        [[buffer(4)]],   // (2C,)
+    device const SCALAR_T* layer_scale  [[buffer(5)]],   // (C,)
     constant uint&     C2           [[buffer(6)]],   // 2*C
     constant uint&     N            [[buffer(7)]],
     constant float&    eps          [[buffer(8)]],
@@ -66,9 +71,9 @@ kernel void norm_glu_ls_resid_fp16(
     const uint C = C2 >> 1;
     const uint total_in  = C2 * N;
     const uint total_out = C  * N;
-    device const half* z_b = z + b * total_in;
-    device const half* r_b = residual + b * total_out;
-    device half*       o_b = out + b * total_out;
+    device const SCALAR_T* z_b = z + b * total_in;
+    device const SCALAR_T* r_b = residual + b * total_out;
+    device SCALAR_T*       o_b = out + b * total_out;
 
     float local_sum = 0.0f, local_sqsum = 0.0f;
     for (uint i = tid; i < total_in; i += tgs) {
@@ -112,18 +117,18 @@ kernel void norm_glu_ls_resid_fp16(
         float sig = 1.0f / (1.0f + exp(-b_val));
         float ls = float(layer_scale[c]);
         float resid = float(r_b[i]);
-        o_b[i] = half(a * sig * ls + resid);
+        o_b[i] = SCALAR_T(a * sig * ls + resid);
     }
 }
 
 kernel void apply_norm_glu_ls_resid_fp16(
-    device half*        out             [[buffer(0)]],
-    device const half*  z               [[buffer(1)]],
-    device const half*  residual        [[buffer(2)]],
+    device SCALAR_T*        out             [[buffer(0)]],
+    device const SCALAR_T*  z               [[buffer(1)]],
+    device const SCALAR_T*  residual        [[buffer(2)]],
     device const float* meanvar         [[buffer(3)]],
-    device const half*  nweight         [[buffer(4)]],
-    device const half*  nbias           [[buffer(5)]],
-    device const half*  layer_scale     [[buffer(6)]],
+    device const SCALAR_T*  nweight         [[buffer(4)]],
+    device const SCALAR_T*  nbias           [[buffer(5)]],
+    device const SCALAR_T*  layer_scale     [[buffer(6)]],
     constant uint&      total_in_per_b  [[buffer(7)]],   // 2C * N
     constant uint&      total_out_per_b [[buffer(8)]],   // C  * N
     constant uint&      num_tiles       [[buffer(9)]],
@@ -141,9 +146,9 @@ kernel void apply_norm_glu_ls_resid_fp16(
     float mean  = meanvar[b * 2 + 0];
     float scale = meanvar[b * 2 + 1];
 
-    device const half* z_b   = z        + b * total_in_per_b;
-    device const half* r_b   = residual + b * total_out_per_b;
-    device half*       o_b   = out      + b * total_out_per_b;
+    device const SCALAR_T* z_b   = z        + b * total_in_per_b;
+    device const SCALAR_T* r_b   = residual + b * total_out_per_b;
+    device SCALAR_T*       o_b   = out      + b * total_out_per_b;
 
     for (uint i = start + tid; i < end; i += tgs) {
         uint c  = i / N;
@@ -159,6 +164,46 @@ kernel void apply_norm_glu_ls_resid_fp16(
         float sig = 1.0f / (1.0f + exp(-b_val));
         float ls = float(layer_scale[c]);
         float resid = float(r_b[i]);
-        o_b[i] = half(a * sig * ls + resid);
+        o_b[i] = SCALAR_T(a * sig * ls + resid);
+    }
+}
+
+// Plain GLU along channel dim (dim=1) for already-normalised inputs.
+//
+// Input (B, 2C, *), output (B, C, *). Used by FusedHEncLayer/FusedHDecLayer
+// when the layer's outer norm is Identity (HTDemucs default norm_starts=4
+// with depth=4 means none of the outer encoder/decoder norms ever apply),
+// in which case F.glu(rewrite_output, dim=1) is the only post-conv op left.
+//
+// Multi-threadgroup launch: ``num_tiles`` threadgroups per batch, each
+// covering ``total_out / num_tiles`` output elements. Saturates the GPU
+// even at the typical inference batch size of 1.
+kernel void glu_channelwise(
+    device SCALAR_T*       out         [[buffer(0)]],   // (B, C, N)
+    device const SCALAR_T* in_         [[buffer(1)]],   // (B, 2C, N)
+    constant uint&         C           [[buffer(2)]],   // output channels
+    constant uint&         N           [[buffer(3)]],   // product of spatial dims
+    constant uint&         num_tiles   [[buffer(4)]],
+    uint bt  [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]]
+) {
+    uint b = bt / num_tiles;
+    uint t = bt % num_tiles;
+    uint total_in  = 2 * C * N;
+    uint total_out = C * N;
+    uint start = (uint)((ulong)t * (ulong)total_out / (ulong)num_tiles);
+    uint end   = (uint)((ulong)(t + 1) * (ulong)total_out / (ulong)num_tiles);
+
+    device const SCALAR_T* in_b  = in_ + b * total_in;
+    device SCALAR_T*       out_b = out + b * total_out;
+
+    for (uint i = start + tid; i < end; i += tgs) {
+        uint c  = i / N;
+        uint sp = i % N;
+        float a     = float(in_b[c          * N + sp]);
+        float b_val = float(in_b[(c + C)    * N + sp]);
+        float sig   = 1.0f / (1.0f + exp(-b_val));
+        out_b[i]    = SCALAR_T(a * sig);
     }
 }

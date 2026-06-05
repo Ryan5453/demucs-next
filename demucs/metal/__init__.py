@@ -83,24 +83,38 @@ _KERNEL_SOURCES: dict[str, str] = {
 }
 
 
-_compiled_libraries: dict[str, Any] = {}
-_compiled_kernels: dict[str, Any] = {}
+_compiled_libraries: dict[tuple[str, torch.dtype], Any] = {}
+_compiled_kernels: dict[tuple[str, torch.dtype], Any] = {}
+
+# Map torch dtype -> Metal scalar typename injected into the kernel source via
+# a ``#define SCALAR_T ...`` prepended at compile time. The .metal files were
+# rewritten to use ``SCALAR_T`` instead of ``half`` so the same source compiles
+# for both FP16 and BF16.
+_DTYPE_TO_METAL: dict[torch.dtype, str] = {
+    torch.float16: "half",
+    torch.bfloat16: "bfloat",
+}
+
+_LP_DTYPES = frozenset(_DTYPE_TO_METAL.keys())
 
 
-def _get_kernel(name: str) -> Any:
-    """Look up a Metal kernel by name; compile its source file once and
-    cache both the library and the per-kernel handle.
+def _get_kernel(name: str, dtype: torch.dtype) -> Any:
+    """Look up a Metal kernel by ``(name, dtype)``; compile its source file
+    once per dtype and cache both the library and the per-kernel handle.
 
-    PyTorch's ``torch.mps.compile_shader`` does not deduplicate identical
-    sources internally, so we cache the compiled library by filename.
+    The same ``.metal`` source compiles for either ``half`` or ``bfloat`` —
+    we prepend ``#define SCALAR_T <type>`` and call
+    ``torch.mps.compile_shader`` once per dtype per file. PyTorch's API
+    doesn't deduplicate identical sources internally, so we cache here.
     """
-    cached = _compiled_kernels.get(name)
+    cache_key = (name, dtype)
+    cached = _compiled_kernels.get(cache_key)
     if cached is not None:
         return cached
     if not hasattr(torch.mps, "compile_shader"):
         raise RuntimeError(
             "torch.mps.compile_shader unavailable; need PyTorch >= 2.6 for "
-            "Metal kernel-backed FP16 inference."
+            "Metal kernel-backed low-precision inference."
         )
     source_file = _KERNEL_SOURCES.get(name)
     if source_file is None:
@@ -108,12 +122,22 @@ def _get_kernel(name: str) -> Any:
             f"Unknown Metal kernel {name!r}; expected one of "
             f"{sorted(_KERNEL_SOURCES)}"
         )
-    lib = _compiled_libraries.get(source_file)
+    metal_type = _DTYPE_TO_METAL.get(dtype)
+    if metal_type is None:
+        raise ValueError(
+            f"Metal kernels are only built for {_LP_DTYPES}; got {dtype!r}"
+        )
+    lib_key = (source_file, dtype)
+    lib = _compiled_libraries.get(lib_key)
     if lib is None:
-        lib = torch.mps.compile_shader(_load_metal_source(source_file))
-        _compiled_libraries[source_file] = lib
+        src = _load_metal_source(source_file)
+        # Prepend the SCALAR_T define so the .metal source compiles to the
+        # requested scalar type. ``half`` is the file-level default so the
+        # define is technically redundant for FP16 but kept uniform.
+        lib = torch.mps.compile_shader(f"#define SCALAR_T {metal_type}\n{src}")
+        _compiled_libraries[lib_key] = lib
     fn = getattr(lib, name)
-    _compiled_kernels[name] = fn
+    _compiled_kernels[cache_key] = fn
     return fn
 
 
@@ -184,12 +208,10 @@ class MetalGroupNorm(nn.Module):
         return cached
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # FP32 / non-MPS: defer to PyTorch's native group_norm.
-        if x.dtype == torch.float32 or x.device.type != "mps":
-            return F.group_norm(x, 1, self.weight, self.bias, self.eps)
-
-        if x.dtype != torch.float16:
-            # Other low-precision dtypes (e.g. bfloat16) — let PyTorch handle.
+        # FP32 / non-MPS / unsupported low-precision dtype: defer to PyTorch.
+        if x.device.type != "mps" or x.dtype not in _LP_DTYPES:
+            if x.dtype == torch.float32 or x.device.type != "mps":
+                return F.group_norm(x, 1, self.weight, self.bias, self.eps)
             return F.group_norm(
                 x.to(torch.float32), 1, self.weight, self.bias, self.eps
             ).to(x.dtype)
@@ -205,7 +227,7 @@ class MetalGroupNorm(nn.Module):
         weight, bias = self._fp16_affine(x.dtype, x.device)
 
         if per_batch <= self._SINGLE_STAGE_LIMIT:
-            kernel = _get_kernel("group_norm_g1_fp16")
+            kernel = _get_kernel("group_norm_g1_fp16", x.dtype)
             max_tgs = min(kernel.max_threads_per_threadgroup, 1024)
             tgs = 256
             while tgs > max_tgs:
@@ -248,9 +270,9 @@ class MetalGroupNorm(nn.Module):
         meanvar = torch.empty((B, 2), dtype=torch.float32, device=x.device)
         out = torch.empty_like(x_contig)
 
-        k1 = _get_kernel("partial_reduce_fp16")
-        k2 = _get_kernel("finalize_meanvar")
-        k3 = _get_kernel("apply_norm_fp16")
+        k1 = _get_kernel("partial_reduce_fp16", x.dtype)
+        k2 = _get_kernel("finalize_meanvar", x.dtype)
+        k3 = _get_kernel("apply_norm_fp16", x.dtype)
 
         tgs1 = 256
         while tgs1 > k1.max_threads_per_threadgroup:
@@ -312,13 +334,13 @@ class FusedGroupNormGelu(MetalGroupNorm):
     """
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # FP32 / non-MPS: hand to PyTorch.
-        if x.dtype == torch.float32 or x.device.type != "mps":
-            return F.gelu(
-                F.group_norm(x, 1, self.weight, self.bias, self.eps),
-                approximate="tanh",
-            )
-        if x.dtype != torch.float16:
+        # FP32 / non-MPS / unsupported low-precision dtype: hand to PyTorch.
+        if x.device.type != "mps" or x.dtype not in _LP_DTYPES:
+            if x.dtype == torch.float32 or x.device.type != "mps":
+                return F.gelu(
+                    F.group_norm(x, 1, self.weight, self.bias, self.eps),
+                    approximate="tanh",
+                )
             return F.gelu(
                 F.group_norm(
                     x.to(torch.float32), 1, self.weight, self.bias, self.eps
@@ -336,7 +358,7 @@ class FusedGroupNormGelu(MetalGroupNorm):
         weight, bias = self._fp16_affine(x.dtype, x.device)
 
         if per_batch <= self._SINGLE_STAGE_LIMIT:
-            kernel = _get_kernel("group_norm_g1_gelu_fp16")
+            kernel = _get_kernel("group_norm_g1_gelu_fp16", x.dtype)
             tgs = min(256, kernel.max_threads_per_threadgroup)
             while tgs > 1 and tgs > per_batch:
                 tgs //= 2
@@ -362,9 +384,9 @@ class FusedGroupNormGelu(MetalGroupNorm):
         meanvar = torch.empty((B, 2), dtype=torch.float32, device=x.device)
         out = torch.empty_like(x_contig)
 
-        k1 = _get_kernel("partial_reduce_fp16")
-        k2 = _get_kernel("finalize_meanvar")
-        k3 = _get_kernel("apply_norm_gelu_fp16")
+        k1 = _get_kernel("partial_reduce_fp16", x.dtype)
+        k2 = _get_kernel("finalize_meanvar", x.dtype)
+        k3 = _get_kernel("apply_norm_gelu_fp16", x.dtype)
 
         tgs1 = min(256, k1.max_threads_per_threadgroup)
         tgs2 = min(num_tiles, k2.max_threads_per_threadgroup)
@@ -396,11 +418,11 @@ class FusedGroupNormGlu(MetalGroupNorm):
     """
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dtype == torch.float32 or x.device.type != "mps":
-            return F.glu(
-                F.group_norm(x, 1, self.weight, self.bias, self.eps), dim=1,
-            )
-        if x.dtype != torch.float16:
+        if x.device.type != "mps" or x.dtype not in _LP_DTYPES:
+            if x.dtype == torch.float32 or x.device.type != "mps":
+                return F.glu(
+                    F.group_norm(x, 1, self.weight, self.bias, self.eps), dim=1,
+                )
             return F.glu(
                 F.group_norm(
                     x.to(torch.float32), 1, self.weight, self.bias, self.eps
@@ -424,12 +446,12 @@ class FusedGroupNormGlu(MetalGroupNorm):
         weight, bias = self._fp16_affine(x.dtype, x.device)
 
         if per_batch_in <= self._SINGLE_STAGE_LIMIT:
-            kernel = _get_kernel("group_norm_g1_glu_fp16")
+            kernel = _get_kernel("group_norm_g1_glu_fp16", x.dtype)
             tgs = min(256, kernel.max_threads_per_threadgroup)
             while tgs > 1 and tgs > per_batch_out:
                 tgs //= 2
             out_shape = (B, C_half) + tuple(x_contig.shape[2:])
-            out = torch.empty(out_shape, dtype=torch.float16, device=x.device)
+            out = torch.empty(out_shape, dtype=x.dtype, device=x.device)
             kernel(
                 out, x_contig, weight, bias,
                 C_in, N, float(self.eps),
@@ -452,11 +474,11 @@ class FusedGroupNormGlu(MetalGroupNorm):
         scratch = torch.empty((B, num_tiles, 2), dtype=torch.float32, device=x.device)
         meanvar = torch.empty((B, 2), dtype=torch.float32, device=x.device)
         out_shape = (B, C_half) + tuple(x_contig.shape[2:])
-        out = torch.empty(out_shape, dtype=torch.float16, device=x.device)
+        out = torch.empty(out_shape, dtype=x.dtype, device=x.device)
 
-        k1 = _get_kernel("partial_reduce_fp16")
-        k2 = _get_kernel("finalize_meanvar")
-        k3 = _get_kernel("apply_norm_glu_fp16")
+        k1 = _get_kernel("partial_reduce_fp16", x.dtype)
+        k2 = _get_kernel("finalize_meanvar", x.dtype)
+        k3 = _get_kernel("apply_norm_glu_fp16", x.dtype)
 
         tgs1 = min(256, k1.max_threads_per_threadgroup)
         tgs2 = min(num_tiles, k2.max_threads_per_threadgroup)
@@ -506,7 +528,7 @@ class FusedGluLayerScaleResidual(nn.Module):
         return cached
 
     def forward(self, z: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
-        if z.dtype == torch.float32 or z.device.type != "mps" or z.dtype != torch.float16:
+        if z.device.type != "mps" or z.dtype not in _LP_DTYPES:
             # Fallback: explicit eltwise ops.
             return residual + self.layer_scale[:, None] * F.glu(z, dim=1)
 
@@ -522,8 +544,8 @@ class FusedGluLayerScaleResidual(nn.Module):
             N *= d
         ls = self._fp16_scale(z.dtype, z.device)
         out_shape = (B, C) + tuple(z_c.shape[2:])
-        out = torch.empty(out_shape, dtype=torch.float16, device=z.device)
-        kernel = _get_kernel("glu_layerscale_resid_fp16")
+        out = torch.empty(out_shape, dtype=z.dtype, device=z.device)
+        kernel = _get_kernel("glu_layerscale_resid_fp16", z.dtype)
         tgs = min(256, kernel.max_threads_per_threadgroup)
         kernel(out, z_c, r_c, ls, C, N, threads=B * tgs, group_size=tgs)
         return out
@@ -574,12 +596,8 @@ class FusedNormGluLayerScaleResid(MetalGroupNorm):
     def forward(
         self, z: torch.Tensor, residual: torch.Tensor
     ) -> torch.Tensor:
-        # FP32 / non-MPS / non-FP16: explicit eltwise.
-        if (
-            z.dtype == torch.float32
-            or z.device.type != "mps"
-            or z.dtype != torch.float16
-        ):
+        # FP32 / non-MPS / unsupported low-precision dtype: explicit eltwise.
+        if z.device.type != "mps" or z.dtype not in _LP_DTYPES:
             zn = F.group_norm(z, 1, self.weight, self.bias, self.eps)
             return residual + self.layer_scale[:, None] * F.glu(zn, dim=1)
 
@@ -598,10 +616,10 @@ class FusedNormGluLayerScaleResid(MetalGroupNorm):
         weight, bias = self._fp16_affine(z.dtype, z.device)
         ls = self._fp16_layer_scale(z.dtype, z.device)
         out_shape = (B, C) + tuple(z_c.shape[2:])
-        out = torch.empty(out_shape, dtype=torch.float16, device=z.device)
+        out = torch.empty(out_shape, dtype=z.dtype, device=z.device)
 
         if per_batch_in <= self._SINGLE_STAGE_LIMIT:
-            kernel = _get_kernel("norm_glu_ls_resid_fp16")
+            kernel = _get_kernel("norm_glu_ls_resid_fp16", z.dtype)
             tgs = min(256, kernel.max_threads_per_threadgroup)
             kernel(
                 out, z_c, r_c, weight, bias, ls,
@@ -623,9 +641,9 @@ class FusedNormGluLayerScaleResid(MetalGroupNorm):
         scratch = torch.empty((B, num_tiles, 2), dtype=torch.float32, device=z.device)
         meanvar = torch.empty((B, 2), dtype=torch.float32, device=z.device)
 
-        k1 = _get_kernel("partial_reduce_fp16")
-        k2 = _get_kernel("finalize_meanvar")
-        k3 = _get_kernel("apply_norm_glu_ls_resid_fp16")
+        k1 = _get_kernel("partial_reduce_fp16", z.dtype)
+        k2 = _get_kernel("finalize_meanvar", z.dtype)
+        k3 = _get_kernel("apply_norm_glu_ls_resid_fp16", z.dtype)
 
         tgs1 = min(256, k1.max_threads_per_threadgroup)
         tgs2 = min(num_tiles, k2.max_threads_per_threadgroup)
@@ -694,39 +712,32 @@ class MetalMyGroupNorm(nn.Module):
             x = F.group_norm(x, 1, self.weight, self.bias, self.eps)
             return x.transpose(1, 2)
 
-        # FP16 on MPS: the kernel's logical shape is ``(B, C=T*C', N=1)`` —
-        # but it's simpler to reshape to ``(B, 1, T*C)`` and let the kernel
-        # do a single big reduction, then apply the per-channel affine
-        # (broadcast along the last dim) on the way out. We do the affine
-        # ourselves rather than smuggling C into the kernel since the
-        # kernel's affine indexing assumes ``(B, C, N)`` layout.
-        if x.dtype != torch.float16:
+        # Unrecognised low-precision dtype — fall back via FP32 cast plus the
+        # transpose dance the original module did.
+        if x.dtype not in _LP_DTYPES:
             x_t = x.transpose(1, 2)
             return F.group_norm(
                 x_t.to(torch.float32), 1, self.weight, self.bias, self.eps
             ).to(x.dtype).transpose(1, 2)
 
-        # Direct path: reduce over (T, C) per batch, normalise, apply
-        # per-channel affine — all in the kernel via the (B, T, C) layout
-        # treated as (B, 1, T*C). We use the GroupNorm kernel with C=1, N=T*C
-        # so weight/bias must be size 1; we then re-apply affine here.
-        # For simplicity we just call F.group_norm with the FP32-cast path
-        # which is already fast, AND we benefit from skipping the transpose
-        # of the input tensor (still a win).
+        # Low-precision direct path. Skip the transpose by flattening
+        # (B, T, C) to (B, T*C) for the reduction; broadcast the per-channel
+        # affine via the trailing C axis.
+        #
+        # Reduce in FP32 for both FP16 and BF16. The cast looks redundant for
+        # BF16 (which has FP32's dynamic range), but PyTorch's MPS native
+        # ``mean``/``var`` on BF16 are ~2x slower than on FP32 at the
+        # cross-transformer's shapes — the cast-and-reduce path wins
+        # decisively (~0.2 ms vs ~0.4 ms at (1, 1344, 384)).
         x_contig = x.contiguous()
         B = x_contig.shape[0]
         T = x_contig.shape[1]
         C = x_contig.shape[2]
         n_per_batch = T * C
-        # Use FP32 cast path. MyGroupNorm sees ``|x|`` up to ~2700 in our
-        # model, which would overflow ``x*x`` in FP16 promoting reductions
-        # — so we always cast here for safety.
-        # Flatten to (B, T*C), reduce in FP32, broadcast back, apply affine.
         x_flat = x_contig.view(B, n_per_batch).to(torch.float32)
         mean = x_flat.mean(dim=1, keepdim=True)
         var = x_flat.var(dim=1, unbiased=False, keepdim=True)
         x_norm = (x_flat - mean) * torch.rsqrt(var + self.eps)
-        # Apply affine: weight/bias have shape (C,), broadcast over (B, T, ?).
         x_norm = x_norm.view(B, T, C).to(x.dtype)
         w, b = self._fp16_affine(x.dtype, x.device)
         return x_norm * w + b
@@ -1059,7 +1070,7 @@ class MetalMultiheadAttention(nn.Module):
             or not self.batch_first
             or not self._packed_qkv
             or query.device.type != "mps"
-            or query.dtype != torch.float16
+            or query.dtype not in _LP_DTYPES
         ):
             return self._fallback(
                 query,
@@ -1074,9 +1085,18 @@ class MetalMultiheadAttention(nn.Module):
 
         is_self_attn = query is key and key is value
         E = self.embed_dim
+        H = self.num_heads
+        D = self.head_dim
+        B = query.size(0)
+        Lq = query.size(1)
+
+        # Projections in the input dtype (MPS BF16/FP16 matmul is fast). For
+        # self-attention the packed (B, L, 3E) QKV is contiguous after the
+        # linear; cross-attention does three separate linears.
         if is_self_attn:
             qkv = F.linear(query, self.in_proj_weight, self.in_proj_bias)
             q, k, v = qkv.chunk(3, dim=-1)
+            Lk = Lq
         else:
             wq = self.in_proj_weight[:E]
             wk = self.in_proj_weight[E : 2 * E]
@@ -1090,27 +1110,38 @@ class MetalMultiheadAttention(nn.Module):
             q = F.linear(query, wq, bq)
             k = F.linear(key, wk, bk)
             v = F.linear(value, wv, bv)
-
-        B = q.size(0)
-        Lq = q.size(1)
-        Lk = k.size(1)
-        H = self.num_heads
-        D = self.head_dim
+            Lk = k.size(1)
 
         q = q.view(B, Lq, H, D).transpose(1, 2)
         k = k.view(B, Lk, H, D).transpose(1, 2)
         v = v.view(B, Lk, H, D).transpose(1, 2)
 
-        # Cast just for the SDPA call. PyTorch's MPS FP16 SDPA runs slower
-        # than its FP32 path because of internal upcasting; the FP16 linear
-        # projections around it still save time.
-        q32 = q.to(torch.float32)
-        k32 = k.to(torch.float32)
-        v32 = v.to(torch.float32)
-        out = F.scaled_dot_product_attention(
-            q32, k32, v32,
-            attn_mask=attn_mask, dropout_p=0.0, is_causal=is_causal,
-        ).to(torch.float16)
+        # Manual SDPA via matmul. PyTorch's MPS fused SDPA has measurable
+        # per-call dispatch overhead at the cross-transformer's B=1 shapes;
+        # decomposing it into matmul → softmax → matmul lets us:
+        #   1. Run both matmuls in FP16/BF16 (MPS matmul has fast LP paths)
+        #   2. Use ``F.softmax`` directly — PyTorch's MPS softmax on a
+        #      low-precision input *already promotes to FP32 internally*,
+        #      so explicitly casting first is redundant (verified: MAE
+        #      identical between native and FP32-cast softmax in both dtypes).
+        # Wins ~6 ms/forward for FP16 and ~7 ms/forward for BF16 vs the
+        # FP32-cast-everything SDPA path.
+        #
+        # Mask/causal: fall back to PyTorch SDPA (very rare in this model;
+        # cross-transformer uses neither).
+        if attn_mask is None and not is_causal:
+            scale = D ** -0.5
+            scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+            scores = F.softmax(scores, dim=-1)
+            out = torch.matmul(scores, v)
+        else:
+            q32 = q.to(torch.float32)
+            k32 = k.to(torch.float32)
+            v32 = v.to(torch.float32)
+            out = F.scaled_dot_product_attention(
+                q32, k32, v32,
+                attn_mask=attn_mask, dropout_p=0.0, is_causal=is_causal,
+            ).to(query.dtype)
 
         out = out.transpose(1, 2).reshape(B, Lq, self.embed_dim)
         out = self.out_proj(out)

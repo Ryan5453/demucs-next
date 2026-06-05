@@ -9,11 +9,16 @@
 //
 // ``apply_norm_gelu_fp16`` is the third stage of the multi-stage path; its
 // mean/scale come from ``finalize_meanvar`` over in ``group_norm.metal``.
-// Auto-organized for demucs-next FP16 inference on MPS.
+// Same source compiles for FP16 (half) and BF16 (bfloat) — the Python side
+// prepends ``#define SCALAR_T bfloat`` to switch.
 // See ``demucs/metal/__init__.py`` for the Python-side wrappers.
 
 #include <metal_stdlib>
 using namespace metal;
+
+#ifndef SCALAR_T
+#define SCALAR_T half
+#endif
 
 inline float gelu_tanh(float y) {
     // sqrt(2/pi) = 0.7978845608028654
@@ -22,10 +27,10 @@ inline float gelu_tanh(float y) {
 }
 
 kernel void group_norm_g1_gelu_fp16(
-    device half*       out      [[buffer(0)]],
-    device const half* in_      [[buffer(1)]],
-    device const half* weight   [[buffer(2)]],
-    device const half* bias     [[buffer(3)]],
+    device SCALAR_T*       out      [[buffer(0)]],
+    device const SCALAR_T* in_      [[buffer(1)]],
+    device const SCALAR_T* weight   [[buffer(2)]],
+    device const SCALAR_T* bias     [[buffer(3)]],
     constant uint&     C        [[buffer(4)]],
     constant uint&     N        [[buffer(5)]],
     constant float&    eps      [[buffer(6)]],
@@ -38,8 +43,8 @@ kernel void group_norm_g1_gelu_fp16(
     threadgroup float shared_sqsum[MAX_TGS];
 
     const uint total = C * N;
-    device const half* in_b = in_ + b * total;
-    device half*       out_b = out + b * total;
+    device const SCALAR_T* in_b = in_ + b * total;
+    device SCALAR_T*       out_b = out + b * total;
 
     float local_sum = 0.0f, local_sqsum = 0.0f;
     for (uint i = tid; i < total; i += tgs) {
@@ -76,16 +81,16 @@ kernel void group_norm_g1_gelu_fp16(
         float w     = float(weight[c_idx]);
         float bv    = float(bias[c_idx]);
         float y     = (v - mean) * scale * w + bv;
-        out_b[i]    = half(gelu_tanh(y));
+        out_b[i]    = SCALAR_T(gelu_tanh(y));
     }
 }
 
 kernel void apply_norm_gelu_fp16(
-    device half*        out          [[buffer(0)]],
-    device const half*  in_          [[buffer(1)]],
+    device SCALAR_T*        out          [[buffer(0)]],
+    device const SCALAR_T*  in_          [[buffer(1)]],
     device const float* meanvar      [[buffer(2)]],
-    device const half*  weight       [[buffer(3)]],
-    device const half*  bias         [[buffer(4)]],
+    device const SCALAR_T*  weight       [[buffer(3)]],
+    device const SCALAR_T*  bias         [[buffer(4)]],
     constant uint&      total_per_b  [[buffer(5)]],
     constant uint&      num_tiles    [[buffer(6)]],
     constant uint&      N            [[buffer(7)]],
@@ -101,8 +106,8 @@ kernel void apply_norm_gelu_fp16(
     float mean  = meanvar[b * 2 + 0];
     float scale = meanvar[b * 2 + 1];
 
-    device const half* x_b   = in_ + b * total_per_b;
-    device half*       out_b = out + b * total_per_b;
+    device const SCALAR_T* x_b   = in_ + b * total_per_b;
+    device SCALAR_T*       out_b = out + b * total_per_b;
 
     for (uint i = start + tid; i < end; i += tgs) {
         uint  c_idx = i / N;
@@ -110,6 +115,6 @@ kernel void apply_norm_gelu_fp16(
         float w     = float(weight[c_idx]);
         float bv    = float(bias[c_idx]);
         float y     = (v - mean) * scale * w + bv;
-        out_b[i]    = half(gelu_tanh(y));
+        out_b[i]    = SCALAR_T(gelu_tanh(y));
     }
 }

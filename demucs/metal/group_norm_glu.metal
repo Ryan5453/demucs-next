@@ -11,17 +11,22 @@
 // ``group_norm.metal``. Crucially it tiles the OUTPUT space (size C*N),
 // not the input — each output element pulls its two input channels by
 // absolute offset so the tile boundaries don't matter.
-// Auto-organized for demucs-next FP16 inference on MPS.
+// Same source compiles for FP16 (half) and BF16 (bfloat) — the Python side
+// prepends ``#define SCALAR_T bfloat`` to switch.
 // See ``demucs/metal/__init__.py`` for the Python-side wrappers.
 
 #include <metal_stdlib>
 using namespace metal;
 
+#ifndef SCALAR_T
+#define SCALAR_T half
+#endif
+
 kernel void group_norm_g1_glu_fp16(
-    device half*       out      [[buffer(0)]],   // (B, C/2, N)
-    device const half* in_      [[buffer(1)]],   // (B, C,   N)
-    device const half* weight   [[buffer(2)]],   // (C,)
-    device const half* bias     [[buffer(3)]],   // (C,)
+    device SCALAR_T*       out      [[buffer(0)]],   // (B, C/2, N)
+    device const SCALAR_T* in_      [[buffer(1)]],   // (B, C,   N)
+    device const SCALAR_T* weight   [[buffer(2)]],   // (C,)
+    device const SCALAR_T* bias     [[buffer(3)]],   // (C,)
     constant uint&     C        [[buffer(4)]],
     constant uint&     N        [[buffer(5)]],
     constant float&    eps      [[buffer(6)]],
@@ -36,8 +41,8 @@ kernel void group_norm_g1_glu_fp16(
     const uint C_half = C >> 1;
     const uint total_in  = C * N;
     const uint total_out = C_half * N;
-    device const half* in_b = in_ + b * total_in;
-    device half*       out_b = out + b * total_out;
+    device const SCALAR_T* in_b = in_ + b * total_in;
+    device SCALAR_T*       out_b = out + b * total_out;
 
     float local_sum = 0.0f, local_sqsum = 0.0f;
     for (uint i = tid; i < total_in; i += tgs) {
@@ -80,16 +85,16 @@ kernel void group_norm_g1_glu_fp16(
         float a = (float(in_b[idx_a]) - mean) * scale * wa + ba;
         float b_val = (float(in_b[idx_b]) - mean) * scale * wb + bb;
         float sig = 1.0f / (1.0f + exp(-b_val));
-        out_b[i] = half(a * sig);
+        out_b[i] = SCALAR_T(a * sig);
     }
 }
 
 kernel void apply_norm_glu_fp16(
-    device half*        out          [[buffer(0)]],   // (B, C/2 * N)
-    device const half*  in_          [[buffer(1)]],   // (B, C * N)
+    device SCALAR_T*        out          [[buffer(0)]],   // (B, C/2 * N)
+    device const SCALAR_T*  in_          [[buffer(1)]],   // (B, C * N)
     device const float* meanvar      [[buffer(2)]],
-    device const half*  weight       [[buffer(3)]],
-    device const half*  bias         [[buffer(4)]],
+    device const SCALAR_T*  weight       [[buffer(3)]],
+    device const SCALAR_T*  bias         [[buffer(4)]],
     constant uint&      total_in_per_b  [[buffer(5)]], // C * N
     constant uint&      total_out_per_b [[buffer(6)]], // C_half * N
     constant uint&      num_tiles    [[buffer(7)]],
@@ -109,8 +114,8 @@ kernel void apply_norm_glu_fp16(
     float mean  = meanvar[b * 2 + 0];
     float scale = meanvar[b * 2 + 1];
 
-    device const half* x_b   = in_  + b * total_in_per_b;
-    device half*       out_b = out  + b * total_out_per_b;
+    device const SCALAR_T* x_b   = in_  + b * total_in_per_b;
+    device SCALAR_T*       out_b = out  + b * total_out_per_b;
 
     for (uint i = start + tid; i < end; i += tgs) {
         uint c_out = i / N;
@@ -124,6 +129,6 @@ kernel void apply_norm_glu_fp16(
         float a = (float(x_b[idx_a]) - mean) * scale * wa + ba;
         float b_val = (float(x_b[idx_b]) - mean) * scale * wb + bb;
         float sig = 1.0f / (1.0f + exp(-b_val));
-        out_b[i] = half(a * sig);
+        out_b[i] = SCALAR_T(a * sig);
     }
 }
