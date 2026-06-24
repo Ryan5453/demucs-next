@@ -182,9 +182,16 @@ def separate_command(
         console.print("[red]No audio files found to process.[/red]")
         raise typer.Exit(1)
 
-    # Catch an unsupported --format before any model download or separation
-    # work: encode a tiny silent clip the same way export_stem will.
-    _validate_output_format(format)
+    # Catch an unsupported output container before any model download or
+    # separation work: encode a tiny silent clip the same way export_stem
+    # will. A literal extension in the template (e.g. ``out/{stem}.flac``)
+    # overrides --format since export keys the container off the path suffix,
+    # so validate that extension when present rather than the unused --format.
+    template_suffix = Path(output).suffix.lstrip(".")
+    effective_format = (
+        template_suffix if template_suffix and "{" not in template_suffix else format
+    )
+    _validate_output_format(effective_format)
 
     if model.value == ModelName.auto.value:
         selected_model_name, only_load_stem = select_model(

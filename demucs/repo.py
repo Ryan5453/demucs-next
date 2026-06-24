@@ -29,8 +29,8 @@ def check_checksum(path: Path, checksum: str) -> None:
 
     :param path: Path to the file to check
     :param checksum: Expected SHA-256 hex digest — the full 64 characters from
-        metadata's ``sha256`` field, or a shorter prefix (upstream's 8-char
-        file-naming checksum) when no full digest is available
+        metadata's ``sha256`` field (the repository requires a full digest per
+        layer at load time, so this is never a truncated prefix in practice)
     :raises ModelLoadingError: If the actual checksum does not match the expected
         one, or the expected checksum is empty (which would match anything)
     """
@@ -99,7 +99,18 @@ class ModelRepository:
                     checksum = model_entry["checksum"]
                     remote_path = model_entry["remote"]
                     self._layer_urls[checksum] = f"{BASE_CDN_URL}/{remote_path}"
-                    self._layer_sha256[checksum] = model_entry.get("sha256", checksum)
+                    # Loading runs ``torch.load(weights_only=False)``, which can
+                    # execute arbitrary pickle code, so a full 64-char SHA-256 is
+                    # the integrity gate. Refuse to register a layer that lacks
+                    # one rather than silently fall back to the 8-char filename
+                    # checksum (a 32-bit check is not an integrity guarantee).
+                    sha = model_entry.get("sha256")
+                    if not isinstance(sha, str) or len(sha) != 64:
+                        raise ModelLoadingError(
+                            f"Layer {checksum} of model {model_name} is missing a "
+                            "full 64-character sha256 in metadata; refusing to load."
+                        )
+                    self._layer_sha256[checksum] = sha
 
     def get_cache_info(self) -> dict[str, dict]:
         """
@@ -162,8 +173,7 @@ class ModelRepository:
 
         :param url: URL to download the layer from
         :param cache_path: Local path to cache the downloaded layer
-        :param expected_checksum: Expected SHA-256 checksum for verification
-            (full digest, or a shorter prefix when no full digest is known)
+        :param expected_checksum: Expected full 64-character SHA-256 digest for verification
         :param progress_callback: Optional callback for download progress updates
         :param model_name: Name of the model being downloaded
         :param layer_index: Index of the current layer (1-based)
@@ -195,8 +205,13 @@ class ModelRepository:
                         },
                     )
 
+                # Stage the temp file inside the cache dir so the final
+                # ``shutil.move`` is a same-filesystem atomic rename rather than
+                # a cross-device copy (which a concurrent reader could observe
+                # half-written).
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
                 with tempfile.NamedTemporaryFile(
-                    delete=False, suffix=".th"
+                    delete=False, suffix=".th", dir=cache_path.parent
                 ) as tmp_file:
                     tmp_path = Path(tmp_file.name)
                     chunk_counter = 0
@@ -254,7 +269,6 @@ class ModelRepository:
 
             # Bytes are verified — now load and move into the cache.
             model_data = torch.load(tmp_path, map_location="cpu", weights_only=False)
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(tmp_path), str(cache_path))
             tmp_path = None
 

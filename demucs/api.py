@@ -790,6 +790,10 @@ class Separator:
             return None
         if channels <= 0 or not raw:
             return None
+        # A truncated data chunk (byte count not a whole number of frames)
+        # can't be reshaped; fall back to torchcodec rather than crash.
+        if len(raw) % (2 * channels) != 0:
+            return None
         samples = np.frombuffer(raw, dtype="<i2").reshape(-1, channels)
         wav = torch.from_numpy(samples.astype(np.float32).T / 32768.0)
         return wav, sample_rate
@@ -1003,7 +1007,7 @@ class Separator:
     # capture verification was wrong, which we'd rather see as a loud
     # failure than silently halve and continue.)
 
-    def _stage_for_inference(self, wavs: list[Tensor]) -> list[Tensor]:
+    def _stage_for_inference(self, wavs: list[Tensor], shifts: int) -> list[Tensor]:
         """
         Move decoded waveforms to the GPU up front when the GPU-resident
         separation pipeline will be used for them.
@@ -1018,17 +1022,35 @@ class Separator:
         are only staged when the accumulators will also fit. CPU/MPS inputs
         are returned unchanged (``apply_model`` stages MPS itself).
 
+        The shift path (``shifts >= 1``) keeps more resident on the mix's
+        device than the unshifted accumulator alone: each round pads the mix to
+        ``length + 2 * max_shift`` and the cross-round accumulator holds a full
+        ``[sources, channels, length]`` output. The unshifted helper re-gates
+        its *own* accumulators against live VRAM and falls back to CPU, but
+        those two tensors are allocated unconditionally on the mix's device, so
+        the staging estimate must cover them or staging could OOM where the
+        helper's self-gating wouldn't have.
+
         :param wavs: Decoded ``[channels, samples]`` waveforms.
+        :param shifts: Number of shift rounds the forward pass will run.
         :return: The waveforms, possibly moved to the CUDA device.
         """
         if self.device != "cuda":
             return wavs
-        total_needed = sum(
-            _gpu_accum_bytes_needed(
-                1, len(self.model.sources), w.shape[-2], w.shape[-1]
+        n_sources = len(self.model.sources)
+        max_shift = int(0.5 * self.model.samplerate) if shifts else 0
+        total_needed = 0
+        for w in wavs:
+            channels, length = w.shape[-2], w.shape[-1]
+            # The helper accumulates over the shifted view (length + max_shift).
+            needed = _gpu_accum_bytes_needed(
+                1, n_sources, channels, length + max_shift
             )
-            for w in wavs
-        )
+            if shifts:
+                # Per-round padded copy + the full-length cross-round accumulator.
+                needed += channels * (length + 2 * max_shift) * 4
+                needed += n_sources * channels * length * 4
+            total_needed += needed
         if total_needed <= _gpu_accum_budget_bytes(self.device):
             return [w.to(self.device) for w in wavs]
         return wavs
@@ -1113,7 +1135,7 @@ class Separator:
         wav = self._to_tensor(audio)
         original = wav.clone()
 
-        wav = self._stage_for_inference([wav])[0]
+        wav = self._stage_for_inference([wav], shifts)[0]
         self._seed_rngs(seed)
         wav, mean, std = self._normalize(wav)
 
@@ -1161,7 +1183,7 @@ class Separator:
         wavs = [self._to_tensor(a) for a in audios]
         originals = [w.clone() for w in wavs]
 
-        wavs = self._stage_for_inference(wavs)
+        wavs = self._stage_for_inference(wavs, shifts)
 
         # Per-input normalisation stats — applied locally and reversed after
         # the forward, via the same helper ``_separate_one`` uses.

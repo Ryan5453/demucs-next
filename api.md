@@ -72,6 +72,8 @@ The model's training segment length (`max_allowed_segment * samplerate`, e.g. 7.
 
 **Bounded GPU memory.** On CUDA, the input waveform and output accumulators stay GPU-resident when they fit a conservative fraction of the *currently free* VRAM (~30 % after a 2 GiB reserve) — the normal case for songs, where the whole separation then runs on-GPU with a single GPU→CPU transfer at the end. Inputs too long for that budget (think hours of audio) automatically fall back to CPU accumulation with per-batch GPU→CPU transfers, which bounds VRAM usage by `model + cudagraph_pool + active_batch` regardless of audio length — a 10-hour file uses the same VRAM as a 6-minute one, just with the old per-batch transfer cost. On MPS (unified memory) the accumulator always stays on-device.
 
+**WAV fast path.** Plain 16-bit PCM WAV inputs (file path or bytes) are decoded with a direct header parse + `int16`→`float32` conversion, roughly 2x faster than and sample-exact with the torchcodec/FFmpeg path. Every other format and codec — and any malformed WAV — transparently falls back to torchcodec, so this only affects decode speed, never output.
+
 Example:
 
 ```python

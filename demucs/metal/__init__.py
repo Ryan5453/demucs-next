@@ -796,6 +796,11 @@ class FusedNormGluLayerScaleResid(MetalGroupNorm):
         if per_batch_in <= self._SINGLE_STAGE_LIMIT:
             kernel = _get_kernel("norm_glu_ls_resid", z.dtype)
             tgs = _pow2_tgs(kernel.max_threads_per_threadgroup)
+            # Don't launch more threads than the apply loop has output elements
+            # (the reduction over per_batch_in still covers all input via the
+            # strided loop). Mirrors the group_norm_glu single-stage clamp.
+            while tgs > 1 and tgs > per_batch_out:
+                tgs //= 2
             kernel(
                 out,
                 z_c,
