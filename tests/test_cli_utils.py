@@ -106,3 +106,14 @@ def test_expand_paths_flags_unresolvable_inputs(tmp_path: Path) -> None:
     empty = tmp_path / "empty"
     empty.mkdir()
     assert expand_paths_to_audio_files([empty]) == ([], True)
+
+
+def test_format_output_path_does_not_rescan_substituted_values() -> None:
+    """
+    Substitution is single-pass: a placeholder appearing literally in a
+    track's filename must not be expanded inside the substituted value.
+    """
+    out = format_output_path(
+        "out/{track}.wav", "m", Path("my{stem}.flac"), "vocals", "wav"
+    )
+    assert out == Path("out/my{stem}.wav")

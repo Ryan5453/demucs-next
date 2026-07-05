@@ -5,14 +5,14 @@ export {
     SEGMENT_SAMPLES,
     SEGMENT_SECONDS,
     SEGMENT_OVERLAP,
-} from './constants';
-export type { ModelType } from './constants';
+} from './constants.js';
+export type { ModelType } from './constants.js';
 
-export { Separator } from './separator';
-export type { LoadModelOptions, ModelPrecision } from './separator';
+export { Separator } from './separator.js';
+export type { LoadModelOptions, ModelPrecision } from './separator.js';
 
 export type {
     SeparationProgress,
     SeparationOptions,
     SeparationResult,
-} from './pipeline';
+} from './pipeline.js';

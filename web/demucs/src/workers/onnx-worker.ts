@@ -118,16 +118,28 @@ self.onmessage = async (event: MessageEvent<Message>) => {
             return;
         }
 
+        // Track every tensor created in this run for the finally block —
+        // otherwise a failed run leaks WASM-heap/GPU buffers per segment
+        // until the worker is torn down.
+        const owned: { dispose(): void }[] = [];
         try {
+            // Push each tensor as soon as it exists — if a later constructor
+            // throws, the earlier ones must still reach the finally block.
             const specReal = new onnx.Tensor('float32', msg.specReal, msg.specShape);
+            owned.push(specReal);
             const specImag = new onnx.Tensor('float32', msg.specImag, msg.specShape);
+            owned.push(specImag);
             const audio = new onnx.Tensor('float32', msg.audio, msg.audioShape);
+            owned.push(audio);
 
             const results = await session.run({
                 spec_real: specReal,
                 spec_imag: specImag,
                 audio,
             });
+            for (const tensor of Object.values(results)) {
+                owned.push(tensor);
+            }
 
             const outSpecReal = results.out_spec_real;
             const outSpecImag = results.out_spec_imag;
@@ -143,30 +155,34 @@ self.onmessage = async (event: MessageEvent<Message>) => {
                 ['out_spec_imag', outSpecImag],
                 ['out_wave', outWave],
             ] as const) {
+                if (tensor === undefined) {
+                    throw new Error(`Model produced no '${name}' output`);
+                }
                 if (tensor.type !== 'float32') {
                     throw new Error(
                         `Expected output '${name}' to be float32, got '${tensor.type}'`
                     );
                 }
             }
+            // Only out_spec_real's dims are forwarded as outSpecShape, so
+            // make sure the imag plane actually shares them.
+            if (outSpecImag.dims.join(',') !== outSpecReal.dims.join(',')) {
+                throw new Error(
+                    `out_spec_imag dims [${outSpecImag.dims}] differ from ` +
+                        `out_spec_real dims [${outSpecReal.dims}]`
+                );
+            }
 
-            // Copy each output's bytes into fresh buffers so we no longer
-            // depend on dispose() running after postMessage. Dispose the
-            // tensors right away to free their backing buffers (WASM heap /
-            // GPU) — otherwise they'd only be reclaimed by GC finalizers and
-            // accumulate across every segment of every track.
+            // Copy each output's bytes into fresh buffers so nothing posted
+            // depends on the tensors' backing storage; the finally block
+            // then disposes the tensors (WASM heap / GPU) — otherwise they'd
+            // only be reclaimed by GC finalizers and accumulate across every
+            // segment of every track.
             const outSpecRealData = new Float32Array(outSpecReal.data as Float32Array);
             const outSpecImagData = new Float32Array(outSpecImag.data as Float32Array);
             const outWaveData = new Float32Array(outWave.data as Float32Array);
             const outSpecShape = outSpecReal.dims as number[];
             const outWaveShape = outWave.dims as number[];
-
-            specReal.dispose();
-            specImag.dispose();
-            audio.dispose();
-            outSpecReal.dispose();
-            outSpecImag.dispose();
-            outWave.dispose();
 
             const response: RunResponse = {
                 type: 'run',
@@ -196,6 +212,14 @@ self.onmessage = async (event: MessageEvent<Message>) => {
                 error: (error as Error).message,
             };
             self.postMessage(response);
+        } finally {
+            for (const tensor of owned.splice(0)) {
+                try {
+                    tensor.dispose();
+                } catch {
+                    // Best-effort cleanup; the response already went out.
+                }
+            }
         }
         return;
     }

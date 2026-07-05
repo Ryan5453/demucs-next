@@ -212,41 +212,58 @@ async function decodeWithFFmpeg(
     debug('Loading ffmpeg.wasm for decoding...');
     const ffmpeg = await loadFFmpeg();
 
-    // Write input file to virtual filesystem
     const inputName = 'input' + getExtension(fileName);
-    await ffmpeg.writeFile(inputName, new Uint8Array(arrayBuffer));
-
-    // Extract artwork first (before modifying the file)
-    const artwork = await extractArtworkWithFFmpeg(ffmpeg, inputName);
-
-    // Extract metadata (title, artist)
-    const { title, artist } = await extractMetadataWithFFmpeg(ffmpeg, inputName);
-
-    // Convert to WAV format (universally decodable)
     const outputName = 'output.wav';
-    await ffmpeg.exec([
-        '-i', inputName,
-        '-ar', String(targetSampleRate),
-        '-ac', '2', // stereo
-        '-f', 'wav',
-        outputName
-    ]);
 
-    // Read output file
-    const outputData = await ffmpeg.readFile(outputName);
+    let artwork: string | null = null;
+    try {
+        // Write input file to virtual filesystem (inside the cleanup scope so
+        // a partial write is removed too).
+        await ffmpeg.writeFile(inputName, new Uint8Array(arrayBuffer));
 
-    // Clean up virtual filesystem
-    await ffmpeg.deleteFile(inputName);
-    await ffmpeg.deleteFile(outputName);
+        // Extract artwork first (before modifying the file)
+        artwork = await extractArtworkWithFFmpeg(ffmpeg, inputName);
 
-    // Decode the WAV with native Web Audio API
-    const audioContext = new AudioContext({ sampleRate: targetSampleRate });
-    const wavData = outputData as Uint8Array;
-    const wavBuffer = wavData.buffer.slice(wavData.byteOffset, wavData.byteOffset + wavData.byteLength) as ArrayBuffer;
-    const buffer = await audioContext.decodeAudioData(wavBuffer);
-    await audioContext.close();
+        // Extract metadata (title, artist)
+        const { title, artist } = await extractMetadataWithFFmpeg(ffmpeg, inputName);
 
-    return { buffer, artwork, title, artist };
+        // Convert to WAV format (universally decodable)
+        await ffmpeg.exec([
+            '-i', inputName,
+            '-ar', String(targetSampleRate),
+            '-ac', '2', // stereo
+            '-f', 'wav',
+            outputName
+        ]);
+
+        // Read output file
+        const outputData = await ffmpeg.readFile(outputName);
+
+        // Decode the WAV with native Web Audio API. Close the context on
+        // every path — Chrome caps live AudioContexts (~6), so leaking one
+        // per failed decode would eventually break audio in the session.
+        const audioContext = new AudioContext({ sampleRate: targetSampleRate });
+        try {
+            const wavData = outputData as Uint8Array;
+            const wavBuffer = wavData.buffer.slice(wavData.byteOffset, wavData.byteOffset + wavData.byteLength) as ArrayBuffer;
+            const buffer = await audioContext.decodeAudioData(wavBuffer);
+            return { buffer, artwork, title, artist };
+        } finally {
+            await audioContext.close().catch(() => {});
+        }
+    } catch (error) {
+        // Mirror the mediabunny path: don't leak the artwork blob URL when
+        // the decode fails after extraction.
+        if (artwork) {
+            URL.revokeObjectURL(artwork);
+        }
+        throw error;
+    } finally {
+        // The ffmpeg instance is persistent — clear the MEMFS files on every
+        // path so failed decodes don't accumulate track-sized files.
+        await ffmpeg.deleteFile(inputName).catch(() => {});
+        await ffmpeg.deleteFile(outputName).catch(() => {});
+    }
 }
 
 /**

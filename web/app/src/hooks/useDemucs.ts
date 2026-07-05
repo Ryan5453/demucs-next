@@ -22,6 +22,13 @@ export function useDemucs() {
     const audioContextRef = useRef<AudioContext | null>(null);
     const separatorRef = useRef<Separator | null>(null);
     const modelLoadInFlightRef = useRef(false);
+    const separateInFlightRef = useRef(false);
+    const loadAudioInFlightRef = useRef(false);
+    // Read at separation time (not captured at click time) so a click-time
+    // closure that survives an await — e.g. Home's handleSeparate awaiting a
+    // long model download while the user swaps tracks — separates the track
+    // the UI is actually showing.
+    const audioBufferRef = useRef<AudioBuffer | null>(null);
 
     // Store pre-created blob URLs
     const [stemUrls, setStemUrls] = useState<Record<string, string>>({});
@@ -71,6 +78,12 @@ export function useDemucs() {
             addLog('A model load is already in progress', 'error');
             return false;
         }
+        // Swapping models mid-separation would unload the live separator and
+        // destroy the run.
+        if (separateInFlightRef.current) {
+            addLog('Cannot switch models while separation is in progress', 'error');
+            return false;
+        }
         modelLoadInFlightRef.current = true;
 
         try {
@@ -116,6 +129,23 @@ export function useDemucs() {
     }, []);
 
     const loadAudio = useCallback(async (file: File) => {
+        // Swapping tracks mid-separation would publish the old track's stems
+        // under the new track's metadata when the run finishes.
+        if (separateInFlightRef.current) {
+            const message = 'Cannot load a new track while separation is in progress';
+            addLog(message, 'error');
+            setAudioError(message);
+            return;
+        }
+        // Two racing decodes would interleave their state writes (and leak
+        // the loser's artwork URL).
+        if (loadAudioInFlightRef.current) {
+            const message = 'A track is already loading';
+            addLog(message, 'error');
+            setAudioError(message);
+            return;
+        }
+        loadAudioInFlightRef.current = true;
         try {
             // Revoke object URLs from the previous track before it is replaced.
             setStemUrls(prev => {
@@ -161,6 +191,7 @@ export function useDemucs() {
 
             addLog('Audio loaded successfully.', 'success');
 
+            audioBufferRef.current = audioBuffer;
             setState(prev => ({
                 ...prev,
                 audioLoaded: true,
@@ -171,6 +202,8 @@ export function useDemucs() {
             const errorMessage = (error as Error).message;
             addLog(`Failed to load audio: ${errorMessage}`, 'error');
             setAudioError(errorMessage);
+        } finally {
+            loadAudioInFlightRef.current = false;
         }
     }, [addLog, getAudioContext]);
 
@@ -180,14 +213,37 @@ export function useDemucs() {
             addLog('Model not loaded', 'error');
             return;
         }
-        if (!state.audioBuffer) {
+        const audioBuffer = audioBufferRef.current;
+        if (!audioBuffer) {
             addLog('Audio not loaded', 'error');
             return;
         }
+        // The library documents concurrent separate() calls on one instance
+        // as unsafe; guard like loadModel does.
+        if (separateInFlightRef.current) {
+            addLog('Separation already in progress', 'error');
+            return;
+        }
+        // Separating while a new track decodes would publish the old track's
+        // stems under the new track's metadata when the decode resolves.
+        if (loadAudioInFlightRef.current) {
+            addLog('Cannot separate while a track is still loading', 'error');
+            return;
+        }
+        // And mid-model-swap the current separator is being torn down.
+        if (modelLoadInFlightRef.current) {
+            addLog('Cannot separate while a model is loading', 'error');
+            return;
+        }
+        separateInFlightRef.current = true;
 
         try {
             setState(prev => ({ ...prev, separating: true }));
-            setStemUrls({});
+            // Revoke the previous run's object URLs before dropping them.
+            setStemUrls(prev => {
+                Object.values(prev).forEach(url => URL.revokeObjectURL(url));
+                return {};
+            });
             setStatus('Preparing audio...');
             setProgress(0);
 
@@ -196,7 +252,7 @@ export function useDemucs() {
             await new Promise(resolve => setTimeout(resolve, 0));
             addLog('Starting separation...', 'info');
 
-            const result = await separator.separate(state.audioBuffer, {
+            const result = await separator.separate(audioBuffer, {
                 onProgress: ({ segIdx, totalSegs, fraction }) => {
                     setStatus(`Separating segment ${segIdx} of ${totalSegs}...`);
                     setProgress(fraction * 95);
@@ -225,8 +281,10 @@ export function useDemucs() {
             setStatus('Error during separation');
             setProgress(0);
             setState(prev => ({ ...prev, separating: false }));
+        } finally {
+            separateInFlightRef.current = false;
         }
-    }, [state.audioBuffer, addLog, setStatus, setProgress]);
+    }, [addLog, setStatus, setProgress]);
 
     // Keep refs in sync with the latest object URLs for the unmount cleanup.
     useEffect(() => {

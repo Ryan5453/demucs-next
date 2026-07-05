@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import gc
+import os
 import random
 import wave
 from io import BytesIO
@@ -23,6 +24,7 @@ from .apply import (
     ModelEnsemble,
     _gpu_accum_budget_bytes,
     _gpu_accum_bytes_needed,
+    _require_cuda_available,
     apply_model,
     apply_model_multi,
 )
@@ -140,6 +142,24 @@ class SeparatedSources:
             return encoded_tensor.numpy().tobytes()
 
 
+def _is_url(audio: "str | Path") -> bool:
+    """
+    Decide whether an audio location should be handed to torchcodec/FFmpeg
+    as a URL (untouched) rather than treated as a local file path.
+
+    A string containing ``"://"`` that does not exist on disk is a URL: a
+    plain substring (not an anchored scheme) so chained FFmpeg protocols
+    like ``cache:https://...`` route correctly, and existing local files
+    always win over protocol-looking names. ``Path`` inputs are never URLs
+    (``Path`` already collapses ``"://"``). Callers exposing this to
+    untrusted strings should validate schemes themselves.
+
+    :param audio: Audio location as given by the caller.
+    :return: True when the input should be decoded as a URL.
+    """
+    return isinstance(audio, str) and "://" in audio and not os.path.exists(audio)
+
+
 def default_device() -> str:
     """
     Pick the best available inference device: cuda > mps > cpu.
@@ -169,13 +189,18 @@ def default_dtype(device: str) -> torch.dtype | None:
 
     :param device: ``"cuda"``, ``"mps"``, or ``"cpu"``.
     :return: Dtype to cast model weights to, or ``None`` to stay at FP32.
+    :raises ValidationError: If ``device`` is not one of the three supported
+        strings, or is ``"cuda"`` without CUDA available.
     """
     if device == "cuda":
+        _require_cuda_available()
         major, _minor = torch.cuda.get_device_capability()
         return torch.float16 if major >= 7 else None
     if device == "mps":
         return torch.float16
-    return None
+    if device == "cpu":
+        return None
+    raise ValidationError(f"Invalid device '{device}'. Must be one of: cpu, cuda, mps")
 
 
 class Separator:
@@ -387,7 +412,10 @@ class Separator:
         transient_per_chunk = reservation_factor * per_chunk_steady
         if transient_per_chunk <= 0:
             return 4
-        return max(1, int(available // transient_per_chunk))
+        # Clamp to the same sanity cap ``separate()`` enforces, so a
+        # pathological measurement can't produce a default that separate()
+        # would then reject.
+        return max(1, min(1024, int(available // transient_per_chunk)))
 
     def _setup_compile(self) -> None:
         """
@@ -422,6 +450,10 @@ class Separator:
             original = getattr(m, "_uncompiled_forward_core", None)
             if original is not None:
                 m.forward_core = original
+                # Drop the marker too: it means "currently compiled" to
+                # _should_restore_submodel_device, and forward_core is eager
+                # again from here on.
+                del m._uncompiled_forward_core
             m._fixed_batch_shape = False
         torch._dynamo.reset()
         gc.collect()
@@ -616,7 +648,8 @@ class Separator:
                      FP16-overflow FP32-fallback cast in MyGroupNorm.
         :param compile: If True, apply ``torch.compile`` for faster inference after an
                        initial warmup. Best for API servers or batch processing; adds
-                       significant latency to the first forward pass.
+                       significant latency to the first forward pass. CUDA only —
+                       silently ignored on CPU/MPS (no measured win there).
         :raises ValidationError: If device is not valid or only_load stem doesn't exist
         :raises ModelLoadingError: If model fails to load
         """
@@ -631,11 +664,8 @@ class Separator:
             raise ValidationError(
                 f"Invalid device '{device}'. Must be one of: {', '.join(sorted(valid_devices))}"
             )
-        if device == "cuda" and not torch.cuda.is_available():
-            raise ValidationError(
-                "Device 'cuda' requested but CUDA is not available in this "
-                "PyTorch build/environment."
-            )
+        if device == "cuda":
+            _require_cuda_available()
         if device == "mps" and not torch.backends.mps.is_available():
             raise ValidationError(
                 "Device 'mps' requested but MPS is not available on this system."
@@ -759,9 +789,11 @@ class Separator:
         Pay the compile + CUDAGraphs capture cost up front instead of on the
         first live request.
 
-        Called automatically at the end of ``__init__`` when ``compile=True``;
-        calling it again later re-runs the dummy inferences (a no-op for
-        correctness, occasionally useful to re-realize the working set). With
+        Warmup already happens during ``__init__`` when ``compile=True`` on
+        CUDA (inside the chunk-batch-size calibration), so calling this is
+        only needed if you skipped it there; calling it again re-runs the
+        dummy inferences (a no-op for correctness, occasionally useful to
+        re-realize the working set). With
         tail-padding (every batch is exactly ``self.chunk_batch_size``) there
         is only one batch shape to warm, so no ``batch_sizes`` argument is
         needed any more.
@@ -801,7 +833,9 @@ class Separator:
                 channels = w.getnchannels()
                 sample_rate = w.getframerate()
                 raw = w.readframes(num_frames)
-        except (wave.Error, EOFError, OSError):
+        except (wave.Error, EOFError, OSError, ValueError):
+            # ValueError: e.g. an embedded NUL byte in the path — fall back so
+            # the decoder path produces the wrapped LoadAudioError.
             return None
         if channels <= 0 or sample_rate <= 0 or not raw:
             return None
@@ -830,11 +864,62 @@ class Separator:
         input_sr: int | None = None
 
         if isinstance(audio, tuple):
+            if len(audio) != 2:
+                raise ValidationError(
+                    f"Expected a (Tensor, sample_rate) tuple, got {len(audio)} "
+                    "elements."
+                )
             wav, input_sr = audio
+            if not isinstance(wav, Tensor):
+                raise ValidationError(
+                    "Expected a torch.Tensor as the first tuple element, got "
+                    f"{type(wav).__name__}."
+                )
+            if wav.dim() not in (1, 2):
+                raise ValidationError(
+                    f"Expected a 1-D or 2-D waveform tensor, got {wav.dim()} "
+                    "dimensions."
+                )
+            if isinstance(input_sr, bool):
+                raise ValidationError("Sample rate must be an int, got bool.")
+            if isinstance(input_sr, (int, np.integer)) or (
+                isinstance(input_sr, (float, np.floating))
+                and float(input_sr).is_integer()
+            ):
+                input_sr = int(input_sr)
+            else:
+                raise ValidationError(
+                    f"Sample rate must be an int, got {type(input_sr).__name__}."
+                )
+            if input_sr <= 0:
+                raise ValidationError(f"Sample rate must be positive, got {input_sr}.")
         elif isinstance(audio, (str, Path)):
-            pcm = self._read_pcm16_wav(audio)
+            is_url = _is_url(audio)
+            if not is_url:
+                try:
+                    Path(audio).stat()
+                except FileNotFoundError:
+                    raise LoadAudioError(f"File not found: {audio}")
+                except (OSError, ValueError):
+                    # Unstat-able for another reason (permissions, NUL byte,
+                    # ...): let the decoder produce the specific error.
+                    pass
+            pcm = None if is_url else self._read_pcm16_wav(audio)
             if pcm is not None:
                 wav, input_sr = pcm
+            elif is_url:
+                try:
+                    # Pass the string untouched: Path() would collapse "://".
+                    decoder = AudioDecoder(audio)
+                    audio_samples = decoder.get_all_samples()
+                    wav = audio_samples.data
+                    input_sr = audio_samples.sample_rate
+                except Exception as e:
+                    # No "file format" hint here — this branch also catches
+                    # nonexistent local paths that merely contain "://".
+                    raise LoadAudioError(
+                        f"Could not load {audio} using torchcodec: {e}"
+                    )
             else:
                 try:
                     # Use native torchcodec AudioDecoder for better performance
@@ -940,20 +1025,25 @@ class Separator:
             for a list input.
         :raises ValidationError: If any parameter value is invalid.
         """
-        # Validate shifts parameter
-        if not isinstance(shifts, int) or shifts < 1 or shifts > 20:
+        # Validate shifts parameter (bool is an int subclass — reject it)
+        if (
+            isinstance(shifts, bool)
+            or not isinstance(shifts, int)
+            or not 1 <= shifts <= 20
+        ):
             raise ValidationError(
                 f"shifts must be an integer between 1 and 20 (inclusive), got {shifts}"
             )
 
-        if seed is not None and not isinstance(seed, int):
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
             raise ValidationError(
                 f"seed must be an integer if provided, got {type(seed)}"
             )
 
-        # Validate split_overlap parameter
+        # Validate split_overlap parameter (bool is an int subclass — reject)
         if (
-            not isinstance(split_overlap, (int, float))
+            isinstance(split_overlap, bool)
+            or not isinstance(split_overlap, (int, float))
             or split_overlap < 0.0
             or split_overlap >= 1.0
         ):
@@ -968,7 +1058,11 @@ class Separator:
         # guard against typos like ``chunk_batch_size=10000`` that would OOM
         # before the calibration loop has a chance to intervene; real workloads
         # never need a four-figure batch on these models.
-        if not isinstance(chunk_batch_size, int) or chunk_batch_size < 1:
+        if (
+            isinstance(chunk_batch_size, bool)
+            or not isinstance(chunk_batch_size, int)
+            or chunk_batch_size < 1
+        ):
             raise ValidationError(
                 f"chunk_batch_size must be a positive integer, got {chunk_batch_size}"
             )
@@ -1065,9 +1159,7 @@ class Separator:
         for w in wavs:
             channels, length = w.shape[-2], w.shape[-1]
             # The helper accumulates over the shifted view (length + max_shift).
-            needed = _gpu_accum_bytes_needed(
-                1, n_sources, channels, length + max_shift
-            )
+            needed = _gpu_accum_bytes_needed(1, n_sources, channels, length + max_shift)
             if shifts:
                 # Per-round padded copy + the full-length cross-round accumulator.
                 needed += channels * (length + 2 * max_shift) * 4
@@ -1098,8 +1190,7 @@ class Separator:
         # Per-stem clone so user mutation (e.g. ``sources["vocals"][:] = 0``)
         # doesn't alias across stems via the shared underlying buffer.
         return {
-            name: unnormed[idx].clone()
-            for idx, name in enumerate(self.model.sources)
+            name: unnormed[idx].clone() for idx, name in enumerate(self.model.sources)
         }
 
     @staticmethod

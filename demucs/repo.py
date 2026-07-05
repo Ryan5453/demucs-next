@@ -5,7 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 
+import copy
 import json
+import os
 import pickle
 import shutil
 import tempfile
@@ -22,6 +24,11 @@ from .states import load_model
 
 BASE_CDN_URL = "https://dl.fbaipublicfiles.com/demucs"
 
+# Prefix for download staging files in the cache dir. Shared by the writer
+# (``_download_and_load_layer``) and the sweeper (``sweep_stale_downloads``)
+# so the two can't silently drift apart.
+STAGING_PREFIX = "tmp"
+
 
 def check_checksum(path: Path, checksum: str) -> None:
     """
@@ -33,12 +40,17 @@ def check_checksum(path: Path, checksum: str) -> None:
     :raises ModelLoadingError: If the actual digest does not match
     """
     sha = sha256()
-    with open(path, "rb") as file:
-        while True:
-            buf = file.read(2**20)
-            if not buf:
-                break
-            sha.update(buf)
+    try:
+        with open(path, "rb") as file:
+            while True:
+                buf = file.read(2**20)
+                if not buf:
+                    break
+                sha.update(buf)
+    except OSError as e:
+        raise ModelLoadingError(
+            f"Could not read {path} for checksum verification: {e}"
+        ) from e
     actual_checksum = sha.hexdigest()
     if actual_checksum != checksum:
         raise ModelLoadingError(
@@ -51,12 +63,17 @@ def get_cache_dir() -> Path:
     """
     Get the cache directory for Demucs models.
 
+    Honours the ``DEMUCS_CACHE_DIR`` environment variable (tilde-expanded and
+    resolved); defaults to ``~/.demucs/models``. The directory is not created
+    here — read paths work against a missing dir, and the download path
+    creates it (surfacing a clear error if it can't).
+
     :return: Path to the cache directory
     """
-    home = Path.home()
-    cache_dir = home / ".demucs" / "models"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir
+    override = os.environ.get("DEMUCS_CACHE_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    return Path.home() / ".demucs" / "models"
 
 
 class ModelRepository:
@@ -107,7 +124,16 @@ class ModelRepository:
             for model_entry in model_info["models"]:
                 checksum = model_entry["checksum"]
                 remote_path = model_entry["remote"]
-                self._layer_urls[checksum] = f"{BASE_CDN_URL}/{remote_path}"
+                url = f"{BASE_CDN_URL}/{remote_path}"
+                # Short checksums key the shared cache/URL registries across
+                # all models — two entries disagreeing under one key would
+                # silently take the last writer.
+                if checksum in self._layer_urls and self._layer_urls[checksum] != url:
+                    raise ModelLoadingError(
+                        f"Layer checksum {checksum} is registered with two "
+                        "different remotes in metadata."
+                    )
+                self._layer_urls[checksum] = url
                 # Loading runs ``torch.load(weights_only=False)``, which can
                 # execute arbitrary pickle code, so a full 64-char SHA-256 is
                 # the integrity gate.
@@ -117,53 +143,78 @@ class ModelRepository:
                         f"Layer {checksum} of model {model_name} is missing a "
                         "full 64-character sha256 in metadata; refusing to load."
                     )
+                if (
+                    checksum in self._layer_sha256
+                    and self._layer_sha256[checksum] != sha
+                ):
+                    raise ModelLoadingError(
+                        f"Layer checksum {checksum} is registered with two "
+                        "different sha256 digests in metadata."
+                    )
                 self._layer_sha256[checksum] = sha
 
     def get_cache_info(self) -> dict[str, dict]:
         """
-        Get information about cached models.
+        Get information about cached models, including partially-cached ones
+        (e.g. an interrupted multi-layer download).
 
-        :return: Dictionary mapping model names to their cache info
+        :return: Dictionary mapping each model name with at least one cached
+            layer to ``{"layers", "size_bytes", "total_layers", "complete"}``
         """
         cache_dir = get_cache_dir()
         cached_models = {}
 
-        # Check which layer files are downloaded
+        # Check which layer files are downloaded. Single stat per file — an
+        # exists()-then-stat() pair would race a concurrent removal.
         cached_layers = {}
-        for checksum, url in self._layer_urls.items():
-            filename = f"{checksum}.th"
-            layer_path = cache_dir / filename
-
-            if layer_path.exists():
+        for checksum in self._layer_urls:
+            layer_path = cache_dir / f"{checksum}.th"
+            try:
                 size_bytes = layer_path.stat().st_size
-                cached_layers[checksum] = {
-                    "path": str(layer_path),
-                    "size_bytes": size_bytes,
-                }
+            except OSError:
+                continue
+            cached_layers[checksum] = {
+                "path": str(layer_path),
+                "size_bytes": size_bytes,
+            }
 
-        # Handle models
         for name, info in self._models.items():
-            if "models" in info:
-                component_layers = info["models"]
-                all_cached = True
-                total_size = 0
-                components = {}
-
-                for component in component_layers:
-                    checksum = component["checksum"]
-                    if checksum in cached_layers:
-                        components[checksum] = cached_layers[checksum]
-                        total_size += cached_layers[checksum]["size_bytes"]
-                    else:
-                        all_cached = False
-
-                if all_cached:
-                    cached_models[name] = {
-                        "layers": components,
-                        "size_bytes": total_size,
-                    }
+            if "models" not in info:
+                continue
+            components = {
+                entry["checksum"]: cached_layers[entry["checksum"]]
+                for entry in info["models"]
+                if entry["checksum"] in cached_layers
+            }
+            if not components:
+                continue
+            cached_models[name] = {
+                "layers": components,
+                "size_bytes": sum(c["size_bytes"] for c in components.values()),
+                "total_layers": len(info["models"]),
+                "complete": len(components) == len(info["models"]),
+            }
 
         return cached_models
+
+    def sweep_stale_downloads(self) -> int:
+        """
+        Remove leftover download staging files from interrupted downloads.
+        Files that vanish concurrently or can't be removed (e.g. held open by
+        an in-flight download on Windows) are skipped. On POSIX an in-flight
+        download's staging file *is* removed — that download then fails
+        cleanly at verification, consistent with the cache wipe requested.
+
+        :return: Number of files removed
+        """
+        removed = 0
+        for tmp_path in get_cache_dir().glob(f"{STAGING_PREFIX}*.th"):
+            try:
+                tmp_path.unlink()
+            except OSError:
+                continue
+            removed += 1
+        return removed
 
     def _download_and_load_layer(
         self,
@@ -218,7 +269,10 @@ class ModelRepository:
                 # half-written).
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
                 with tempfile.NamedTemporaryFile(
-                    delete=False, suffix=".th", dir=cache_path.parent
+                    delete=False,
+                    prefix=STAGING_PREFIX,
+                    suffix=".th",
+                    dir=cache_path.parent,
                 ) as tmp_file:
                     tmp_path = Path(tmp_file.name)
                     chunk_counter = 0
@@ -323,6 +377,10 @@ class ModelRepository:
             )
 
         model_info = self._models[name]
+        if "models" not in model_info:
+            # __init__ skips (rather than rejects) metadata entries without a
+            # layer list, so custom metadata can reach here.
+            raise ModelLoadingError(f"Model {name} has no 'models' list in metadata.")
         weights = model_info.get("weights")
         layer_checksums = [entry["checksum"] for entry in model_info["models"]]
 
@@ -452,15 +510,43 @@ class ModelRepository:
                             },
                         )
                     continue
+                except OSError as exc:
+                    # A direct read failure from torch.load (e.g. the file
+                    # racing a concurrent removal) is not corruption — keep
+                    # the cache and surface the documented error type.
+                    raise ModelLoadingError(
+                        f"Could not read cached layer {cache_path}: {exc}"
+                    ) from exc
                 except (
                     ModelLoadingError,
                     RuntimeError,
                     EOFError,
                     pickle.UnpicklingError,
-                ):
-                    # The cached file is corrupt/unreadable: discard and redownload.
-                    if cache_path.exists():
-                        cache_path.unlink()
+                ) as exc:
+                    if isinstance(exc.__cause__, OSError):
+                        # A read failure (file lock, EIO, permissions) is not
+                        # corruption — keep the cached file and surface the
+                        # error instead of destroying a possibly-valid cache.
+                        # Non-ModelLoadingError carriers (e.g. torch.load
+                        # failing mid-read) still leave as the documented type.
+                        if isinstance(exc, ModelLoadingError):
+                            raise
+                        raise ModelLoadingError(
+                            f"Could not read cached layer {cache_path}: {exc}"
+                        ) from exc
+                    # The cached file is corrupt: discard and redownload.
+                    # ``missing_ok`` covers a concurrent process unlinking it
+                    # first.
+                    try:
+                        cache_path.unlink(missing_ok=True)
+                    except OSError as e:
+                        # NOTE: deliberately not ``from e`` — an OSError cause
+                        # means "transient read failure" to the guard above,
+                        # and this is a failed *corruption* cleanup.
+                        raise ModelLoadingError(
+                            f"Cached layer {cache_path} failed verification and "
+                            f"could not be removed: {e}"
+                        ) from None
 
             # Download and load the layer
             layer = self._download_and_load_layer(
@@ -519,15 +605,10 @@ class ModelRepository:
         """
         List all available models.
 
-        :return: Dictionary mapping model names to their metadata
+        :return: Dictionary mapping model names to their metadata (deep
+            copies — mutating them does not affect repository state)
         """
-        result = {}
-
-        # Add models
-        for name, info in self._models.items():
-            result[name] = info
-
-        return result
+        return {name: copy.deepcopy(info) for name, info in self._models.items()}
 
     def remove_model(self, name: str) -> bool:
         """
@@ -535,6 +616,8 @@ class ModelRepository:
 
         :param name: Model name
         :return: True if the model was removed, False if not found
+        :raises ModelLoadingError: If a cached layer exists but can't be
+            removed (e.g. permissions)
         """
         if name not in self._models:
             return False
@@ -547,8 +630,14 @@ class ModelRepository:
             layer_checksum = layer_info["checksum"]
             filename = f"{layer_checksum}.th"
             layer_path = cache_dir / filename
-            if layer_path.exists():
+            try:
                 layer_path.unlink()
-                removed_any = True
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                raise ModelLoadingError(
+                    f"Could not remove cached layer {layer_path}: {e}"
+                ) from e
+            removed_any = True
 
         return removed_any

@@ -8,10 +8,10 @@ import {
     SEGMENT_SAMPLES,
     SEGMENT_OVERLAP,
     createSplitWeight,
-} from './constants';
-import type { OnnxClient } from './onnx-client';
-import type { STFTClient } from './stft-client';
-import { type ISTFTClient, type ISTFTResult } from './istft-client';
+} from './constants.js';
+import type { OnnxClient } from './onnx-client.js';
+import type { STFTClient } from './stft-client.js';
+import type { ISTFTClient, ISTFTResult } from './istft-client.js';
 
 /** Maximum random shift in samples (Python: int(0.5 * model.samplerate)). */
 const MAX_SHIFT = Math.floor(0.5 * SAMPLE_RATE);
@@ -26,7 +26,10 @@ export interface SeparationProgress {
 }
 
 export interface SeparationOptions {
-    /** Fired after every segment completes (after iSTFT accumulation). */
+    /**
+     * Fired per segment as its inference completes. Final stems are ready
+     * only when the returned promise resolves.
+     */
     onProgress?: (progress: SeparationProgress) => void;
     /**
      * Number of random sub-second shifts to average (the Demucs "shift
@@ -44,6 +47,16 @@ export interface SeparationOptions {
      * ``-1`` and ``2**32 - 1``).
      */
     seed?: number;
+}
+
+/** Throws if an ONNX output shape differs from the dims the pipeline expects. */
+function assertShape(name: string, actual: number[], expected: number[]): void {
+    if (actual.length !== expected.length || actual.some((d, i) => d !== expected[i])) {
+        throw new Error(
+            `Unexpected ONNX output shape for ${name}: got [${actual.join(', ')}], ` +
+            `expected [${expected.join(', ')}]`
+        );
+    }
 }
 
 /** Mulberry32: a 32-bit deterministic PRNG seeded from a single integer. */
@@ -118,6 +131,7 @@ export async function runPipeline(
         const d = (left[i] + right[i]) / 2 - mean;
         refVar += d * d;
     }
+    // Deliberate guard: the reference's unbiased std is NaN for 1-sample input.
     const std = numSamples > 1 ? Math.sqrt(refVar / (numSamples - 1)) : 0;
     const norm = 1 / (1e-5 + std);
 
@@ -279,6 +293,15 @@ export async function runPipeline(
 
             const results = await inferencePromise;
             totalInferenceMs += performance.now() - inferenceStart;
+
+            // The iSTFT worker slices these buffers with subarray, which
+            // clamps silently, so a model with unexpected dims would produce
+            // wrong/zero audio. Fail loudly instead (like the ONNX worker's
+            // dtype check).
+            assertShape('out_spec', results.outSpecShape,
+                [1, sources.length, numChannels, stftResult.numBins, stftResult.numFrames]);
+            assertShape('out_wave', results.outWaveShape,
+                [1, sources.length, numChannels, SEGMENT_SAMPLES]);
 
             if (prevIstftPromise) {
                 accumulate(await prevIstftPromise);

@@ -1,12 +1,12 @@
-import { SAMPLE_RATE, type ModelType } from './constants';
-import { OnnxClient } from './onnx-client';
-import { STFTClient } from './stft-client';
-import { ISTFTClient } from './istft-client';
+import { SAMPLE_RATE, type ModelType } from './constants.js';
+import { OnnxClient } from './onnx-client.js';
+import { STFTClient } from './stft-client.js';
+import { ISTFTClient } from './istft-client.js';
 import {
     runPipeline,
     type SeparationOptions,
     type SeparationResult,
-} from './pipeline';
+} from './pipeline.js';
 
 export type ModelPrecision = 'fp32' | 'fp16';
 
@@ -24,7 +24,7 @@ const MODEL_URLS: Record<ModelType, Record<ModelPrecision, string>> = {
 // Must match the source order baked into the trained model.
 const MODEL_SOURCES: Record<ModelType, string[]> = {
     'htdemucs': ['drums', 'bass', 'other', 'vocals'],
-    'htdemucs_6s': ['drums', 'bass', 'guitar', 'piano', 'other', 'vocals'],
+    'htdemucs_6s': ['drums', 'bass', 'other', 'vocals', 'guitar', 'piano'],
 };
 
 export interface LoadModelOptions {
@@ -106,6 +106,13 @@ export class Separator {
         options: LoadModelOptions = {}
     ): Promise<Separator> {
         const preferredBackend = options.backend ?? 'webgpu';
+        // JS callers can pass anything; fail loudly like unknown
+        // model/precision do instead of silently coercing to wasm.
+        if (preferredBackend !== 'webgpu' && preferredBackend !== 'wasm') {
+            throw new Error(
+                `Unknown backend '${preferredBackend}'. Valid backends: webgpu, wasm.`
+            );
+        }
         // Only probe WebGPU when it could actually be used; skip the adapter
         // request entirely if the caller explicitly asked for 'wasm'.
         let backend: 'webgpu' | 'wasm' =

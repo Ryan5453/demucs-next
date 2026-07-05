@@ -57,6 +57,8 @@ uvx --from demucs-next demucs separate audio_file.mp3
 
 The PyPI package is named `demucs-next`, but the installed CLI command is `demucs`, so `uvx` needs `--from demucs-next` to map the two.
 
+Because `demucs-next` installs the `demucs` module and `demucs` command, it cannot coexist with the original `demucs` package in one environment — uninstall that first.
+
 **Note**: Demucs does not specify a specific PyTorch wheel. This means that GPUs will only work on Apple Silicon or PyTorch's default CUDA version (currently 12.8) on Linux when using uvx. Demucs will fall back to CPU if one of the above conditions are not met. (This uvx default is independent of the Cog/Replicate build, which pins CUDA 12.4 in `cog.yaml`.)
 
 ### Install using UV
@@ -100,11 +102,11 @@ demucs separate /path/to/music/folder
 
 ## Python API Usage
 
-Demucs provides a Python API for separating audio files. Please refer to the [API docs](api.md) for more information.
+Demucs provides a Python API for separating audio files. Please refer to the [API docs](https://github.com/Ryan5453/demucs-next/blob/main/api.md) for more information.
 
 ## ONNX & Browser Usage
 
-Demucs can also run in the browser via ONNX. See the [ONNX export notes](onnx.md) and the [`demucs-next` npm package docs](web/demucs/README.md) for details.
+Demucs can also run in the browser via ONNX. See the [ONNX export notes](https://github.com/Ryan5453/demucs-next/blob/main/onnx.md) and the [`demucs-next` npm package docs](https://github.com/Ryan5453/demucs-next/blob/main/web/demucs/README.md) for details.
 
 ## Cog Usage
 
@@ -112,4 +114,4 @@ Demucs provides a [Cog](https://github.com/replicate/cog), which allows you to e
 
 ## Changelog
 
-The [changelog](changelog.md) contains information about the changes between versions of demucs-next.
+The [changelog](https://github.com/Ryan5453/demucs-next/blob/main/changelog.md) contains information about the changes between versions of demucs-next.

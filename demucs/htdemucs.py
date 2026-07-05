@@ -6,6 +6,7 @@
 
 
 import math
+from typing import Any
 
 import torch
 from torch import nn
@@ -484,6 +485,21 @@ class HTDemucs(nn.Module):
             cache[key] = emb
         return emb
 
+    def _load_from_state_dict(self, *args: Any, **kwargs: Any) -> None:
+        """
+        Load weights and invalidate the memoised frequency embedding —
+        otherwise a reload into an already-used instance keeps serving the
+        old weights' embedding.
+
+        :param args: Forwarded to ``nn.Module._load_from_state_dict``.
+        :param kwargs: Forwarded to ``nn.Module._load_from_state_dict``.
+        :return: None.
+        """
+        cache = getattr(self, "_freq_emb_cache", None)
+        if cache:
+            cache.clear()
+        super()._load_from_state_dict(*args, **kwargs)
+
     def forward_core(
         self, x: torch.Tensor, xt: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -555,10 +571,12 @@ class HTDemucs(nn.Module):
 
         :param mix: Input mixture waveform [B, C, samples]
         :return: Separated sources tensor [B, S, C, samples]
+        :raises ValidationError: If the input is longer than the training
+            length; use ``apply_model`` to separate full-length audio.
         """
         length_pre_pad = None
 
-        training_length = int(self.max_allowed_segment * self.samplerate)
+        training_length = self.valid_length(mix.shape[-1])
         if mix.shape[-1] < training_length:
             length_pre_pad = mix.shape[-1]
             mix = F.pad(mix, (0, training_length - length_pre_pad))

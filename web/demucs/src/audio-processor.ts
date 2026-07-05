@@ -4,8 +4,8 @@
  * across the STFT worker, which is unsafe.
  */
 import FFT from 'fft.js';
-import type { STFTResult } from './constants';
-import { NFFT, HOP_LENGTH, SEGMENT_SAMPLES } from './constants';
+import type { STFTResult } from './constants.js';
+import { NFFT, HOP_LENGTH, SEGMENT_SAMPLES } from './constants.js';
 
 const fftInstance = new FFT(NFFT);
 

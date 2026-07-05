@@ -3,7 +3,7 @@
  * the ONNX and iSTFT workers rather than blocking the main thread.
  */
 
-import { computeSTFT, createSTFTBuffers, type STFTBuffers } from '../audio-processor';
+import { computeSTFT, createSTFTBuffers, type STFTBuffers } from '../audio-processor.js';
 
 let stftBuffers: STFTBuffers | null = null;
 

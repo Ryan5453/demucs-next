@@ -11,6 +11,12 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10,<3.14"
 classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Multimedia :: Sound/Audio",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
@@ -19,7 +25,13 @@ dependencies = [
     "torch>=2.9.0",
     "torchaudio>=2.9.0",
     "torchcodec>=0.8.1",
-    "typer>=0.19.1",
+    # <0.26: the CLI uses click.get_current_context(), which typer 0.26+
+    # breaks by vendoring click (its context stack diverges from real
+    # click's).
+    "typer>=0.19.1,<0.26",
+    # Imported directly by the CLI, not just via typer.
+    "click>=8.1.0",
+    "rich>=13.8.0",
     "httpx>=0.28.1"
 ]
 

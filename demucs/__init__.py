@@ -25,6 +25,7 @@ from .api import (
     SeparatedSources,
     Separator,
     default_device,
+    default_dtype,
     get_version,
     select_model,
 )
@@ -47,6 +48,7 @@ __all__ = [
     "apply_model",
     "apply_model_multi",
     "default_device",
+    "default_dtype",
     "get_version",
     "select_model",
     "DemucsError",

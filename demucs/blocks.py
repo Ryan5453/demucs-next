@@ -4,7 +4,6 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-import math
 from copy import deepcopy
 from typing import Callable
 
@@ -13,25 +12,6 @@ from torch import Tensor, nn
 from torch.nn import functional
 
 from .transformer import LayerScale
-
-
-def unfold(a: Tensor, kernel_size: int, stride: int) -> Tensor:
-    """
-    Extract frames from input with given stride, padding so that F = ceil(T / K).
-
-    :param a: Input tensor of size [*OT, T]
-    :param kernel_size: Size of each extracted frame
-    :param stride: Stride between frames
-    :return: Tensor of size [*OT, F, K]
-    """
-    *shape, length = a.shape
-    n_frames = math.ceil(length / stride)
-    tgt_length = (n_frames - 1) * stride + kernel_size
-    a = functional.pad(a, (0, tgt_length - length))
-    strides = list(a.stride())
-    assert strides[-1] == 1, "data should be contiguous"
-    strides = strides[:-1] + [stride, 1]
-    return a.as_strided([*shape, n_frames, kernel_size], strides)
 
 
 def center_trim(tensor: Tensor, reference: Tensor | int) -> Tensor:
@@ -212,80 +192,6 @@ def ispectro(
     return x.view(*other, output_length)
 
 
-class BLSTM(nn.Module):
-    """
-    BiLSTM with same hidden units as input dim.
-    If `max_steps` is not None, input will be splitting in overlapping
-    chunks and the LSTM applied separately on each chunk.
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        layers: int = 1,
-        max_steps: int | None = None,
-        skip: bool = False,
-    ) -> None:
-        """
-        Initialize BLSTM.
-
-        :param dim: Input and hidden dimension size
-        :param layers: Number of LSTM layers
-        :param max_steps: Max steps before chunking input, must be divisible by 4
-        :param skip: If True, add a skip connection from input to output
-        """
-        super().__init__()
-        assert max_steps is None or max_steps % 4 == 0
-        self.max_steps = max_steps
-        self.lstm = nn.LSTM(
-            bidirectional=True, num_layers=layers, hidden_size=dim, input_size=dim
-        )
-        self.linear = nn.Linear(2 * dim, dim)
-        self.skip = skip
-
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Run the BLSTM on the input, optionally chunking long sequences.
-
-        :param x: Input tensor of shape (B, C, T)
-        :return: Output tensor of shape (B, C, T)
-        """
-        B, C, T = x.shape
-        y = x
-
-        framed = False
-        if self.max_steps is not None and T > self.max_steps:
-            width = self.max_steps
-            stride = width // 2
-            frames = unfold(x, width, stride)
-            nframes = frames.shape[2]
-            framed = True
-            x = frames.permute(0, 2, 1, 3).reshape(-1, C, width)
-
-        x = x.permute(2, 0, 1)
-
-        x = self.lstm(x)[0]
-        x = self.linear(x)
-        x = x.permute(1, 2, 0)
-        if framed:
-            out = []
-            frames = x.reshape(B, -1, C, width)
-            limit = stride // 2
-            for k in range(nframes):
-                if k == 0:
-                    out.append(frames[:, k, :, :-limit])
-                elif k == nframes - 1:
-                    out.append(frames[:, k, :, limit:])
-                else:
-                    out.append(frames[:, k, :, limit:-limit])
-            out = torch.cat(out, -1)
-            out = out[..., :T]
-            x = out
-        if self.skip:
-            x = x + y
-        return x
-
-
 def rescale_conv(
     conv: nn.Conv1d | nn.Conv2d | nn.ConvTranspose1d | nn.ConvTranspose2d,
     reference: float,
@@ -320,7 +226,7 @@ def rescale_module(module: nn.Module, reference: float) -> None:
 class DConv(nn.Module):
     """
     New residual branches in each encoder layer.
-    This alternates dilated convolutions, potentially with LSTMs and attention.
+    This alternates dilated convolutions.
     Also before entering each residual branch, dimension is projected on a smaller subspace,
     e.g. of dim `channels // compress`.
     """
@@ -332,10 +238,6 @@ class DConv(nn.Module):
         depth: int = 2,
         init: float = 1e-4,
         norm: bool = True,
-        attn: bool = False,
-        heads: int = 4,
-        ndecay: int = 4,
-        lstm: bool = False,
         gelu: bool = True,
         kernel: int = 3,
     ) -> None:
@@ -347,10 +249,6 @@ class DConv(nn.Module):
         :param depth: Number of layers in the residual branch
         :param init: Initial scale for LayerNorm
         :param norm: Use GroupNorm
-        :param attn: Use LocalAttention
-        :param heads: Number of heads for the LocalAttention
-        :param ndecay: Number of decay controls in the LocalAttention
-        :param lstm: Use LSTM
         :param gelu: Use GELU activation
         :param kernel: Kernel size for the (dilated) convolutions
         """
@@ -392,10 +290,6 @@ class DConv(nn.Module):
                 nn.GLU(1),
                 LayerScale(channels, init),
             ]
-            if attn:
-                mods.insert(3, LocalState(hidden, heads=heads, ndecay=ndecay))
-            if lstm:
-                mods.insert(3, BLSTM(hidden, layers=2, max_steps=200, skip=True))
             layer = nn.Sequential(*mods)
             self.layers.append(layer)
 
@@ -409,88 +303,6 @@ class DConv(nn.Module):
         for layer in self.layers:
             x = x + layer(x)
         return x
-
-
-class LocalState(nn.Module):
-    """Local state allows to have attention based only on data (no positional embedding),
-    but while setting a constraint on the time window (e.g. decaying penalty term).
-
-    Also a failed experiments with trying to provide some frequency based attention.
-    """
-
-    def __init__(
-        self, channels: int, heads: int = 4, nfreqs: int = 0, ndecay: int = 4
-    ) -> None:
-        """
-        Initialize LocalState attention module.
-
-        :param channels: Number of input channels, must be divisible by heads
-        :param heads: Number of attention heads
-        :param nfreqs: Number of frequency-based attention components
-        :param ndecay: Number of decay controls for time windowing
-        """
-        super().__init__()
-        assert channels % heads == 0, (channels, heads)
-        self.heads = heads
-        self.nfreqs = nfreqs
-        self.ndecay = ndecay
-        self.content = nn.Conv1d(channels, channels, 1)
-        self.query = nn.Conv1d(channels, channels, 1)
-        self.key = nn.Conv1d(channels, channels, 1)
-        if nfreqs:
-            self.query_freqs = nn.Conv1d(channels, heads * nfreqs, 1)
-        if ndecay:
-            self.query_decay = nn.Conv1d(channels, heads * ndecay, 1)
-            # Initialize decay close to zero (there is a sigmoid), for maximum initial window.
-            self.query_decay.weight.data *= 0.01
-            assert self.query_decay.bias is not None  # stupid type checker
-            self.query_decay.bias.data[:] = -2
-        self.proj = nn.Conv1d(channels + heads * nfreqs, channels, 1)
-
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Apply local attention with optional decay and frequency components.
-
-        :param x: Input tensor of shape (B, C, T)
-        :return: Output tensor of shape (B, C, T) with attention applied
-        """
-        B, C, T = x.shape
-        heads = self.heads
-
-        indexes = torch.arange(T, device=x.device, dtype=x.dtype)
-        # left index are keys, right index are queries
-        delta = indexes[:, None] - indexes[None, :]
-
-        queries = self.query(x).view(B, heads, -1, T)
-        keys = self.key(x).view(B, heads, -1, T)
-        # t are keys, s are queries
-        dots = torch.einsum("bhct,bhcs->bhts", keys, queries)
-        dots /= keys.shape[2] ** 0.5
-        if self.nfreqs:
-            periods = torch.arange(1, self.nfreqs + 1, device=x.device, dtype=x.dtype)
-            freq_kernel = torch.cos(2 * math.pi * delta / periods.view(-1, 1, 1))
-            freq_q = self.query_freqs(x).view(B, heads, -1, T) / self.nfreqs**0.5
-            dots += torch.einsum("fts,bhfs->bhts", freq_kernel, freq_q)
-        if self.ndecay:
-            decays = torch.arange(1, self.ndecay + 1, device=x.device, dtype=x.dtype)
-            decay_q = self.query_decay(x).view(B, heads, -1, T)
-            decay_q = torch.sigmoid(decay_q) / 2
-            decay_kernel = -decays.view(-1, 1, 1) * delta.abs() / self.ndecay**0.5
-            dots += torch.einsum("fts,bhfs->bhts", decay_kernel, decay_q)
-
-        # Kill self reference.
-        # This previously used torch.eye() but that is not ONNX compatible for some reason...
-        diag_mask = indexes[:, None] == indexes[None, :]
-        dots.masked_fill_(diag_mask, -100)
-        weights = torch.softmax(dots, dim=2)
-
-        content = self.content(x).view(B, heads, -1, T)
-        result = torch.einsum("bhts,bhct->bhcs", weights, content)
-        if self.nfreqs:
-            time_sig = torch.einsum("bhts,fts->bhfs", weights, freq_kernel)
-            result = torch.cat([result, time_sig], 2)
-        result = result.reshape(B, -1, T)
-        return x + self.proj(result)
 
 
 def pad1d(

@@ -143,7 +143,8 @@ def export_to_onnx(
         noise that pure-fp16 accumulation produces on ORT-WASM.
     :return: Path to the exported ONNX model.
     :raises ImportError: If the ``onnx`` package is not installed.
-    :raises ValueError: If the resolved model is not an ``HTDemucs`` instance.
+    :raises ValueError: If the resolved model is not an ``HTDemucs`` instance
+        or does not use complex-as-channels (``cac=False``).
     """
     try:
         import onnx
@@ -167,6 +168,11 @@ def export_to_onnx(
         raise ValueError(
             f"Model {model_name} is not a supported model type. "
             f"Expected HTDemucs, got {type(model).__name__}"
+        )
+    if not model.cac:
+        raise ValueError(
+            f"Model {model_name} does not use complex-as-channels (cac=False); "
+            "the ONNX wrapper hardcodes CaC spectrogram packing."
         )
     wrapper = HTDemucsONNXWrapper(model)
 

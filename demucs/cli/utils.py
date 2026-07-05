@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -64,9 +65,10 @@ def format_output_path(
         "timestamp": str(int(now.timestamp())),
     }
 
-    formatted_path = template
-    for var, value in variables.items():
-        formatted_path = formatted_path.replace(f"{{{var}}}", value)
+    # Single pass so substituted values are never re-scanned (a track
+    # literally named "my{stem}" must not have {stem} expanded inside it).
+    pattern = re.compile("|".join(re.escape(f"{{{var}}}") for var in variables))
+    formatted_path = pattern.sub(lambda m: variables[m.group(0)[1:-1]], template)
 
     return Path(formatted_path)
 

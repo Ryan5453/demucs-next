@@ -1,4 +1,4 @@
-import type { STFTResult } from './constants';
+import type { STFTResult } from './constants.js';
 
 export class STFTClient {
     private worker: Worker;

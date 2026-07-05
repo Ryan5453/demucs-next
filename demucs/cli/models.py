@@ -46,19 +46,29 @@ def list_models_command() -> None:
         layer_count = len(info.get("models", []))
         stems = ", ".join(info.get("sources", [])) or "N/A"
 
-        is_downloaded = name in cache_info
-        model_size = "N/A"
-        if is_downloaded:
-            model_size = format_file_size(cache_info[name]["size_bytes"])
+        entry = cache_info.get(name)
+        if entry is None:
+            model_size = "N/A"
+            status = "[red]Not Downloaded[/red]"
+        elif entry["complete"]:
+            model_size = format_file_size(entry["size_bytes"])
+            status = "[green]Downloaded[/green]"
+        else:
+            # Partially cached (interrupted download or an --isolate-stem
+            # specialist) — surface it instead of "Not Downloaded" with
+            # invisible disk usage.
+            model_size = format_file_size(entry["size_bytes"])
+            status = (
+                f"[yellow]Partial ({len(entry['layers'])}/"
+                f"{entry['total_layers']} layers)[/yellow]"
+            )
 
         table.add_row(
             name,
             str(layer_count) + (" layer" if layer_count == 1 else " layers"),
             stems,
             model_size,
-            "[green]Downloaded[/green]"
-            if is_downloaded
-            else "[red]Not Downloaded[/red]",
+            status,
         )
 
     console.print(table)
@@ -129,9 +139,18 @@ def remove_models_command(
 
     model_repo = ModelRepository()
 
+    swept = 0
     if all_models:
-        cache_info = model_repo.get_cache_info()
-        model_names = list(cache_info.keys())
+        # get_cache_info includes partially-cached models, so interrupted
+        # downloads are removed too; the sweep clears staging files left by
+        # hard-killed downloads.
+        model_names = list(model_repo.get_cache_info().keys())
+        swept = model_repo.sweep_stale_downloads()
+        if swept:
+            console.print(
+                f"[green]✓[/green] Removed {swept} leftover download temp "
+                f"file{'s' if swept != 1 else ''}"
+            )
     else:
         if names is None or not names:
             console.print(
@@ -143,7 +162,7 @@ def remove_models_command(
 
     # Unknown model names are caller mistakes (typos), distinct from a known
     # model that just isn't cached — report them and exit nonzero.
-    known_models = get_models()
+    known_models = model_repo.list_models()
     unknown = [name for name in model_names if name not in known_models]
     for name in unknown:
         console.print(
@@ -155,6 +174,9 @@ def remove_models_command(
     if not model_names:
         if unknown:
             raise typer.Exit(1)
+        if swept:
+            # Temp files were the only thing to clean up; already reported.
+            return
         # Reached via --all with an empty cache: nothing to do, not an error.
         console.print("[yellow]No models found to remove.[/yellow]")
         return
@@ -172,10 +194,17 @@ def remove_models_command(
             "[yellow]Removing models...", total=len(model_names)
         )
 
+        failed_removals = []
         for name in model_names:
             progress_bar.update(task, description=f"[cyan]Removing {name}...[/cyan]")
 
-            success = model_repo.remove_model(name)
+            try:
+                success = model_repo.remove_model(name)
+            except ModelLoadingError as error:
+                console.print(f"[red]✗[/red] [bold]{name}[/bold]: {error}")
+                failed_removals.append(name)
+                progress_bar.update(task, advance=1)
+                continue
             if success:
                 console.print(f"[green]✓[/green] Removed model [bold]{name}[/bold]")
             else:
@@ -185,7 +214,7 @@ def remove_models_command(
 
             progress_bar.update(task, advance=1)
 
-    if unknown:
+    if unknown or failed_removals:
         raise typer.Exit(1)
     console.print("[bold green]Model removal complete![/bold green]")
 
@@ -341,7 +370,9 @@ def _download_models_batch(model_names: list[str]) -> None:
     for name in model_names:
         if name in unknown:
             continue
-        if name in cache_info:
+        # Partially-cached models (interrupted downloads) still need the
+        # download pass; get_model fetches only the missing layers.
+        if cache_info.get(name, {}).get("complete"):
             layer_count = len(models[name]["models"])
             layer_word = "layer" if layer_count == 1 else "layers"
             size_bytes = cache_info[name]["size_bytes"]

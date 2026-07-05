@@ -14,7 +14,7 @@ import typer
 from torchcodec.encoders import AudioEncoder
 
 from ..api import Separator, default_device, select_model
-from ..exceptions import ValidationError
+from ..exceptions import ModelLoadingError, ValidationError
 from .models import ensure_model_available
 from .progress import FileProgressTracker
 from .types import ClipMode, DeviceType, ModelName, Precision, StemName
@@ -188,9 +188,15 @@ def separate_command(
     # overrides --format since export keys the container off the path suffix,
     # so validate that extension when present rather than the unused --format.
     template_suffix = Path(output).suffix.lstrip(".")
-    effective_format = (
-        template_suffix if template_suffix and "{" not in template_suffix else format
-    )
+    if template_suffix and "{" in template_suffix:
+        # Resolve placeholders so the probe validates the container export
+        # will actually key off: ``.{ext}`` → --format, while e.g.
+        # ``.{timestamp}`` resolves to digits and fails here rather than
+        # per-track after the model download.
+        template_suffix = format_output_path(
+            template_suffix, "model", Path("track.wav"), "stem", format
+        ).name
+    effective_format = template_suffix if template_suffix else format
     _validate_output_format(effective_format)
 
     if model.value == ModelName.auto.value:
@@ -222,8 +228,10 @@ def separate_command(
 
     # only_load (set from --isolate-stem for an explicit model, or by
     # select_model on the auto path) is validated against the model's sources
-    # inside Separator.__init__. Catch that here so an invalid stem prints a
-    # clean message instead of surfacing an uncaught ValidationError traceback.
+    # inside Separator.__init__. ModelLoadingError can also surface here even
+    # after ensure_model_available: a corrupt cache file triggers a
+    # re-download inside get_model, which fails offline. Catch both so they
+    # print a clean message instead of an uncaught traceback.
     try:
         separator = Separator(
             model=selected_model_name,
@@ -232,7 +240,7 @@ def separate_command(
             dtype=dtype,
             compile=compile_model,
         )
-    except ValidationError as error:
+    except (ValidationError, ModelLoadingError) as error:
         console.print(
             f"[red]✗[/red] [bold]{selected_model_name}[/bold]: error: {error}"
         )

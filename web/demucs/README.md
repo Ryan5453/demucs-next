@@ -2,7 +2,7 @@
 
 Browser-side audio source separation using ONNX [Demucs](https://github.com/adefossez/demucs) models. Runs HTDemucs entirely in the browser (WebGPU when available, WASM otherwise), spreading the STFT, ONNX inference, and iSTFT across three Web Workers.
 
-For backend/server-side workflows, use the Python `demucs` package — it is significantly faster than the in-browser ONNX path.
+For backend/server-side workflows, use the `demucs-next` Python package — it is significantly faster than the in-browser ONNX path.
 
 ## Install
 
@@ -75,7 +75,7 @@ await separator.unload();
 
 Loads a model and returns a ready-to-use `Separator`. The model is fetched from HuggingFace (`Ryan5453/demucs-onnx`) on first load and cached by the browser.
 
-- `model`: `'htdemucs'` (4 stems: drums, bass, other, vocals) | `'htdemucs_6s'` (6 stems: drums, bass, guitar, piano, other, vocals)
+- `model`: `'htdemucs'` (4 stems: drums, bass, other, vocals) | `'htdemucs_6s'` (6 stems: drums, bass, other, vocals, guitar, piano)
 - `options.backend`: `'webgpu'` (default) | `'wasm'`. WebGPU falls back to WASM automatically if unavailable or if session creation fails.
 - `options.precision`: `'fp32'` (default) | `'fp16'`. `'fp16'` is a weight-only-fp16 variant — roughly half the download with near-identical (not bit-exact) output: the weights are rounded to fp16, but compute still runs in fp32, so the difference is well below the audible floor.
 - `options.wasmPaths`: override the ORT `.wasm` asset URL prefix

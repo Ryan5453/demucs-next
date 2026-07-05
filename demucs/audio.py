@@ -18,7 +18,7 @@ def convert_audio_channels(wav: Tensor, channels: int = 2) -> Tensor:
     :param wav: Audio tensor to convert
     :param channels: Target number of channels
     :return: Audio tensor with the target number of channels
-    :raises ValueError: If the audio has fewer channels than requested but is not mono
+    :raises ValidationError: If the audio has fewer channels than requested but is not mono
     """
     *shape, src_channels, length = wav.shape
     if src_channels == channels:
@@ -34,7 +34,7 @@ def convert_audio_channels(wav: Tensor, channels: int = 2) -> Tensor:
         # one single channel, replicate the audio over all channels.
         # ``.contiguous()`` materialises the broadcast: ``expand`` returns a
         # stride-0 view, which breaks downstream ops that require a contiguous
-        # last dim (e.g. ``unfold``/``as_strided`` in the time-branch BLSTM).
+        # last dim.
         wav = wav.expand(*shape, channels, length).contiguous()
     elif src_channels >= channels:
         # Case 3:
@@ -43,7 +43,7 @@ def convert_audio_channels(wav: Tensor, channels: int = 2) -> Tensor:
         wav = wav[..., :channels, :]
     else:
         # Case 4: What is a reasonable choice here?
-        raise ValueError(
+        raise ValidationError(
             "The audio file has less channels than requested but is not mono."
         )
     return wav

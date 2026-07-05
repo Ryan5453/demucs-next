@@ -52,8 +52,10 @@ def test_convert_channels_too_few_non_mono_raises() -> None:
     Upmixing a non-mono source to more channels is unsupported.
     """
     wav = torch.randn(2, 100)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValidationError):
         convert_audio_channels(wav, 3)
+    # Pre-v1 callers caught the builtin; ValidationError must stay one.
+    assert issubclass(ValidationError, ValueError)
 
 
 def test_prevent_clip_rescale_bounds_peak() -> None:

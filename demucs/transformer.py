@@ -84,8 +84,12 @@ def create_2d_sin_embedding(
             torch.arange(0.0, d_model, 2, dtype=torch.float32, device=device)
             * -(math.log(max_period) / d_model)
         )
-        pos_w = torch.arange(0.0, width, dtype=torch.float32, device=device).unsqueeze(1)
-        pos_h = torch.arange(0.0, height, dtype=torch.float32, device=device).unsqueeze(1)
+        pos_w = torch.arange(0.0, width, dtype=torch.float32, device=device).unsqueeze(
+            1
+        )
+        pos_h = torch.arange(0.0, height, dtype=torch.float32, device=device).unsqueeze(
+            1
+        )
         pe[0:d_model:2, :, :] = (
             torch.sin(pos_w * div_term)
             .transpose(0, 1)
@@ -206,7 +210,7 @@ class LayerScale(nn.Module):
 
         :param channels: Number of channels to scale
         :param init: Initial value for scale parameters
-        :param channel_last: If False, expects (B, C, T) tensors; if True, expects (T, B, C)
+        :param channel_last: If False, expects (B, C, T) tensors; if True, expects (B, T, C)
         """
         super().__init__()
         self.channel_last = channel_last
@@ -314,7 +318,8 @@ class MyTransformerEncoderLayer(nn.TransformerEncoderLayer):
         """
         Forward pass through the transformer encoder layer.
 
-        :param src: Source tensor of shape (T, B, C) when batch_first=False
+        :param src: Source tensor of shape (B, T, C) (all instances are built
+            with ``batch_first=True``)
         :param src_mask: Attention mask tensor
         :param src_key_padding_mask: Key padding mask tensor
         :return: Transformed tensor of same shape as src
@@ -431,8 +436,8 @@ class CrossTransformerEncoderLayer(nn.Module):
         """
         Forward pass with cross-attention between query and key sequences.
 
-        :param q: Query tensor of shape (T, B, C)
-        :param k: Key tensor of shape (S, B, C)
+        :param q: Query tensor of shape (B, T, C)
+        :param k: Key tensor of shape (B, S, C)
         :param mask: Attention mask tensor of shape (T, S)
         :return: Transformed tensor of same shape as q
         """

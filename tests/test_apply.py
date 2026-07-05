@@ -38,9 +38,7 @@ def test_should_restore_submodel_device_uncompiled_returns_true() -> None:
     """
     sub = nn.Linear(1, 1)
     assert (
-        _should_restore_submodel_device(
-            sub, torch.device("cpu"), torch.device("cuda")
-        )
+        _should_restore_submodel_device(sub, torch.device("cpu"), torch.device("cuda"))
         is True
     )
 
@@ -54,9 +52,7 @@ def test_should_restore_submodel_device_compiled_skips_restore() -> None:
     # Marker attribute set by Separator._compile_htdemucs_forward_core.
     sub._uncompiled_forward_core = lambda *_a, **_kw: None
     assert (
-        _should_restore_submodel_device(
-            sub, torch.device("cpu"), torch.device("cuda")
-        )
+        _should_restore_submodel_device(sub, torch.device("cpu"), torch.device("cuda"))
         is False
     )
 
@@ -205,3 +201,69 @@ def test_apply_model_shifts_progress_single_monotonic_span() -> None:
     total = starts[0]["total_chunks"]
     assert {d["total_chunks"] for d in chunks} == {total}
     assert [d["completed_chunks"] for d in chunks] == list(range(1, total + 1))
+
+
+def test_apply_model_rejects_out_of_range_overlap() -> None:
+    """
+    ``overlap`` outside ``[0, 1)`` is rejected up front — a negative overlap
+    used to leave uncovered sample ranges and silently return NaN audio.
+    """
+    model = _DoublingModel()
+    mix = torch.randn(1, 250)
+    for overlap in (-1.0, 1.0, 1.5):
+        with pytest.raises(ValidationError):
+            apply_model(model, mix, overlap=overlap)
+
+
+def test_htdemucs_forward_rejects_overlength_input() -> None:
+    """
+    ``HTDemucs.forward`` only supports inputs up to the training length —
+    longer ones used to silently return wrong-shaped output because the
+    time-branch ``view`` reinterpreted samples as channels. ``apply_model``
+    is the supported path for full-length audio.
+    """
+    from demucs.htdemucs import HTDemucs
+
+    model = HTDemucs(
+        sources=["a", "b"],
+        samplerate=8000,
+        segment=1.0,
+        nfft=512,
+        depth=2,
+        channels=16,
+        t_layers=1,
+    )
+    model.eval()
+    with pytest.raises(ValidationError):
+        with torch.no_grad():
+            model(torch.randn(1, 2, 16000))
+
+
+def test_htdemucs_freq_emb_cache_invalidated_on_weight_reload() -> None:
+    """
+    Reloading weights into an already-used ``HTDemucs`` must not keep serving
+    the previous weights' memoised frequency embedding.
+    """
+    from demucs.htdemucs import HTDemucs
+
+    kwargs = dict(
+        sources=["a", "b"],
+        samplerate=8000,
+        segment=1.0,
+        nfft=512,
+        depth=2,
+        channels=16,
+        t_layers=1,
+    )
+    torch.manual_seed(0)
+    used = HTDemucs(**kwargs)
+    torch.manual_seed(1)
+    fresh = HTDemucs(**kwargs)
+    used.eval()
+    fresh.eval()
+
+    x = torch.randn(1, 2, 4000)
+    with torch.no_grad():
+        used(x)  # populate the freq-emb cache with `used`'s weights
+        used.load_state_dict(fresh.state_dict())
+        assert torch.allclose(used(x), fresh(x), atol=1e-6)

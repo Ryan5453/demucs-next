@@ -144,9 +144,10 @@ class TensorChunk:
 
     def padded(self, target_length: int) -> Tensor:
         """
-        Return the chunk padded (or trimmed) to ``target_length``, centered on the chunk.
+        Return the chunk padded to ``target_length``, centered on the chunk.
 
-        :param target_length: Desired length of the last dimension.
+        :param target_length: Desired length of the last dimension; must be
+            >= the chunk length (chunks are never trimmed).
         :return: Padded tensor of the requested length.
         """
         delta = target_length - self.length
@@ -202,6 +203,20 @@ _SPLIT_WEIGHT_CACHE: dict[tuple[int, float, torch.device, torch.dtype], Tensor] 
 # active batch" property for arbitrarily long audio.
 _GPU_ACCUM_VRAM_FRACTION = 0.3
 _GPU_ACCUM_VRAM_RESERVE_BYTES = 2 * 1024**3
+
+
+def _require_cuda_available() -> None:
+    """
+    Raise unless CUDA is usable. Shared with ``Separator.__init__`` so the
+    two entry points can't drift on wording.
+
+    :raises ValidationError: If CUDA is not available.
+    """
+    if not torch.cuda.is_available():
+        raise ValidationError(
+            "Device 'cuda' requested but CUDA is not available in this "
+            "PyTorch build/environment."
+        )
 
 
 def _gpu_accum_budget_bytes(device: torch.device | str) -> int:
@@ -339,7 +354,9 @@ def apply_model(
         the model is not such an ensemble or no sub-model matches one-hot.
     :param chunk_batch_size: Chunks processed in parallel.
     :return: Separated sources tensor.
-    :raises ValidationError: If ``overlap`` produces a non-positive segment stride.
+    :raises ValidationError: If ``overlap`` is outside ``[0, 1)``, if the
+        device is invalid, out of range, or is CUDA/MPS without that backend
+        available, or if the overlap produces a non-positive segment stride.
     """
     # Single-mix separation is just the one-element case of the multi-mix
     # path, so we delegate rather than keep a second copy of the chunking /
@@ -414,15 +431,46 @@ def apply_model_multi(
     :param chunk_batch_size: Chunks processed in parallel per forward pass.
     :return: One separated-sources tensor per input mix, same shape as
         ``apply_model`` would have produced.
-    :raises ValidationError: If ``overlap`` produces a non-positive segment stride.
+    :raises ValidationError: If ``overlap`` is outside ``[0, 1)``, if the
+        device is invalid, out of range, or is CUDA/MPS without that backend
+        available, or if the overlap produces a non-positive segment stride.
     """
+    if not 0.0 <= overlap < 1.0:
+        raise ValidationError(f"overlap must be in [0, 1), got {overlap}")
+
+    # Validate an explicit device before the empty-input early return, so
+    # bad arguments raise regardless of input.
+    if device is not None:
+        try:
+            device = torch.device(device)
+        except (TypeError, RuntimeError, ValueError) as e:
+            raise ValidationError(f"Invalid device {device!r}: {e}") from e
+        if device.type == "cuda":
+            _require_cuda_available()
+            if device.index is not None and device.index >= torch.cuda.device_count():
+                raise ValidationError(
+                    f"Device 'cuda:{device.index}' requested but only "
+                    f"{torch.cuda.device_count()} CUDA device(s) are available."
+                )
+            if device.index is None:
+                # An indexless "cuda" never compares equal to a tensor's
+                # "cuda:0", which would defeat every device comparison below
+                # (most visibly the progress-sync branch, which keys off
+                # tensors already living on ``accum_device``).
+                device = torch.device("cuda", torch.cuda.current_device())
+        elif device.type == "mps" and not torch.backends.mps.is_available():
+            raise ValidationError(
+                "Device 'mps' requested but MPS is not available on this system."
+            )
+
     if not mixes:
         return []
 
     if device is None:
+        # A CUDA tensor's device is always indexed ("cuda:N"), so no
+        # normalization is needed on this path (and a CUDA tensor existing
+        # proves CUDA is available).
         device = mixes[0].device
-    else:
-        device = torch.device(device)
 
     # The pooled chunk batching below assumes one accumulator row per chunk,
     # so a mix with batch dim > 1 is split into per-row mixes here and the
@@ -735,8 +783,13 @@ def _apply_model_multi_unshifted(
     :param chunk_batch_size: Number of chunks per forward pass.
     :param progress_callback: Optional callback for progress updates.
     :return: One separated-sources tensor per input mix, in input order.
-    :raises ValidationError: If ``overlap`` produces a non-positive segment stride.
+    :raises ValidationError: If ``overlap`` produces a non-positive segment
+        stride (range validation happens in ``apply_model_multi``).
     """
+    # The accum-device comparisons below need an indexed CUDA device;
+    # apply_model_multi (the only caller) normalizes it (and rejects "cuda"
+    # when CUDA is unavailable, so normalization always happened).
+    assert device.type != "cuda" or device.index is not None
     segment = model.max_allowed_segment
     assert segment > 0.0
     segment_length: int = int(model.samplerate * segment)
@@ -756,12 +809,19 @@ def _apply_model_multi_unshifted(
         for mix in mixes:
             inner = mix.tensor if isinstance(mix, TensorChunk) else mix
             mix_length = mix.length if isinstance(mix, TensorChunk) else mix.shape[-1]
+            batch_dim = inner.shape[0] if inner.dim() > 2 else 1
             bytes_needed += _gpu_accum_bytes_needed(
-                inner.shape[0] if inner.dim() > 2 else 1,
+                batch_dim,
                 len(model.sources),
                 inner.shape[-2],
                 mix_length,
             )
+            if isinstance(mix, TensorChunk) and inner.shape[-1] > mix_length:
+                # The GPU-resident path stages the chunk's entire backing
+                # tensor, not just the viewed span — budget the difference.
+                bytes_needed += (
+                    batch_dim * inner.shape[-2] * (inner.shape[-1] - mix_length) * 4
+                )
         gpu_resident = bytes_needed <= _gpu_accum_budget_bytes(device)
     else:
         gpu_resident = True

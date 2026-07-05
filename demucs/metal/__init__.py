@@ -1045,9 +1045,9 @@ class FusedDConvLayer(nn.Module):
         """
         Build from the standard 7-op DConv ``nn.Sequential``.
 
-        We expect the canonical layout (``norm=True, attn=False, lstm=False``,
-        which is the HTDemucs default). Anything else and the swap is
-        skipped at the apply_metal_optimizations level.
+        We expect the canonical layout (``norm=True``, which is the HTDemucs
+        default). Anything else and the swap is skipped at the
+        apply_metal_optimizations level.
 
         :param seq: The 7-op DConv ``nn.Sequential`` to fold
         :return: A new :class:`FusedDConvLayer` mirroring ``seq``

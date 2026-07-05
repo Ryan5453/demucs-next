@@ -3,9 +3,9 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 
 // onnxruntime-web statically references its .wasm/.mjs assets, so Vite
-// bundles them. We don't want them: the worker sets wasmPaths to a CDN at
-// runtime (see demucs/src/workers/onnx-worker.ts), and the .wasm file alone
-// is 26MB — over Cloudflare Pages' 25MB per-file limit.
+// bundles them. We don't want them: the app passes wasmPaths (src/onnx-config.ts)
+// through Separator.load so ORT fetches them from a CDN, and the .wasm file
+// alone is 26MB — over Cloudflare Pages' 25MB per-file limit.
 const stripOrtAssets: Plugin = {
   name: 'strip-ort-assets',
   apply: 'build',

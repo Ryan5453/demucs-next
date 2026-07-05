@@ -29,9 +29,11 @@ class ModelLoadingError(DemucsError):
     pass
 
 
-class ValidationError(DemucsError):
+class ValidationError(DemucsError, ValueError):
     """
     Exception raised when a parameter value is invalid.
+
+    Also a ``ValueError`` so callers catching the builtin keep working.
     """
 
     pass

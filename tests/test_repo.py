@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from demucs.exceptions import ModelLoadingError
-from demucs.repo import ModelRepository, check_checksum
+from demucs.repo import ModelRepository, check_checksum, get_cache_dir
 
 
 def _good_metadata() -> dict:
@@ -333,3 +333,160 @@ def test_get_model_recovers_from_each_cache_exception_type(
         f"Cache file should be unlinked after {type(exc).__name__}"
     )
     assert len(download_calls) == 1
+
+
+def test_get_cache_dir_env_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    ``DEMUCS_CACHE_DIR`` relocates the model cache away from ``~/.demucs``,
+    with tilde expansion (Docker ENV / systemd values are not shell-expanded),
+    and without creating the directory (that happens on first download).
+    """
+    target = tmp_path / "custom-cache"
+    monkeypatch.setenv("DEMUCS_CACHE_DIR", str(target))
+    assert get_cache_dir() == target
+    assert not target.exists()
+
+    monkeypatch.setenv("DEMUCS_CACHE_DIR", "~/some-demucs-cache")
+    assert get_cache_dir() == Path.home() / "some-demucs-cache"
+
+
+def test_get_cache_info_reports_partial_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A model with some but not all layers cached is reported with
+    ``complete: False`` and the cached subset's size — previously it was
+    omitted entirely, hiding its disk usage from ``models list`` and
+    ``models remove --all``.
+    """
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("DEMUCS_CACHE_DIR", str(cache))
+
+    metadata = _good_metadata()
+    metadata["models"]["fakemodel"]["models"].append(
+        {"remote": "fake/ef012345.th", "checksum": "ef012345", "sha256": "b" * 64}
+    )
+    repo = ModelRepository(metadata_path=_write_metadata(tmp_path, metadata))
+
+    assert repo.get_cache_info() == {}
+
+    (cache / "abcd1234.th").write_bytes(b"xxxx")
+    info = repo.get_cache_info()
+    assert info["fakemodel"]["complete"] is False
+    assert info["fakemodel"]["total_layers"] == 2
+    assert info["fakemodel"]["size_bytes"] == 4
+    assert list(info["fakemodel"]["layers"]) == ["abcd1234"]
+
+    (cache / "ef012345.th").write_bytes(b"yy")
+    info = repo.get_cache_info()
+    assert info["fakemodel"]["complete"] is True
+    assert info["fakemodel"]["size_bytes"] == 6
+
+
+def test_sweep_stale_downloads_removes_staging_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    ``sweep_stale_downloads`` removes ``tmp*.th`` staging leftovers but not
+    cached layer files.
+    """
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("DEMUCS_CACHE_DIR", str(cache))
+
+    (cache / "tmpabc123.th").write_bytes(b"partial download")
+    (cache / "abcd1234.th").write_bytes(b"cached layer")
+
+    repo = ModelRepository(metadata_path=_write_metadata(tmp_path, _good_metadata()))
+    assert repo.sweep_stale_downloads() == 1
+    assert not (cache / "tmpabc123.th").exists()
+    assert (cache / "abcd1234.th").exists()
+
+
+def test_list_models_returns_copies() -> None:
+    """
+    Mutating a ``list_models`` result must not corrupt repository state.
+    """
+    repo = ModelRepository()
+    listed = repo.list_models()
+    name = next(iter(listed))
+    listed[name]["models"] = []
+    assert repo.list_models()[name]["models"], "internal metadata was mutated"
+
+
+@pytest.mark.parametrize(
+    "make_exc, expect_wrapped",
+    [
+        (
+            lambda cause: ModelLoadingError("could not read for verification"),
+            False,
+        ),
+        (lambda cause: RuntimeError("torch.load failed mid-read"), True),
+        (lambda cause: OSError(5, "I/O error"), True),
+    ],
+    ids=["MLE-with-cause", "RuntimeError-with-cause", "raw-OSError"],
+)
+def test_get_model_preserves_cache_on_read_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    make_exc: object,
+    expect_wrapped: bool,
+) -> None:
+    """
+    Read failures (OSError-caused or raw OSError) are not corruption: the
+    cached file must be KEPT, no redownload attempted, and the error must
+    leave ``get_model`` as ``ModelLoadingError`` (wrapped exactly once).
+
+    :param tmp_path: pytest temporary directory fixture
+    :param monkeypatch: pytest monkeypatch fixture
+    :param make_exc: Factory building the exception the cache load raises
+    :param expect_wrapped: Whether get_model wraps it (vs re-raising as-is)
+    """
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    monkeypatch.setattr("demucs.repo.get_cache_dir", lambda: cache_dir)
+
+    cached = cache_dir / "abcd1234.th"
+    cached.write_bytes(b"valid-looking cached layer")
+
+    cause = OSError(13, "Permission denied")
+    exc = make_exc(cause)  # type: ignore[operator]
+
+    def raise_exc(*_args: object, **_kwargs: object) -> None:
+        """
+        Patched ``check_checksum`` raising the parametrized read failure.
+
+        :param _args: ignored positional arguments
+        :param _kwargs: ignored keyword arguments
+        :raises Exception: the parametrized exception (OSError-caused)
+        """
+        if isinstance(exc, OSError):
+            raise exc
+        raise exc from cause
+
+    monkeypatch.setattr("demucs.repo.check_checksum", raise_exc)
+
+    def fail_download(*_args: object, **_kwargs: object) -> None:
+        """
+        Downloader stub that fails the test if recovery wrongly triggers.
+
+        :param _args: ignored positional arguments
+        :param _kwargs: ignored keyword arguments
+        """
+        pytest.fail("read failure must not trigger a redownload")
+
+    monkeypatch.setattr(ModelRepository, "_download_and_load_layer", fail_download)
+
+    repo = ModelRepository(metadata_path=_write_metadata(tmp_path, _good_metadata()))
+    with pytest.raises(ModelLoadingError) as excinfo:
+        repo.get_model("fakemodel")
+
+    assert cached.exists(), "read failure must not unlink the cached file"
+    if expect_wrapped:
+        assert excinfo.value is not exc
+        assert excinfo.value.__cause__ is exc
+    else:
+        assert excinfo.value is exc

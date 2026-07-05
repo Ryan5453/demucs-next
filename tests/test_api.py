@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -10,7 +11,7 @@ from demucs import (
     select_model,
 )
 from demucs.api import Separator
-from demucs.exceptions import ValidationError
+from demucs.exceptions import LoadAudioError, ValidationError
 
 
 def _stub_separator(
@@ -264,7 +265,9 @@ def test_read_pcm16_wav_rejects_non_pcm(tmp_path: object) -> None:
         data = b"\x00" * (ch * sampwidth)
         body = (
             b"WAVEfmt \x10\x00\x00\x00"
-            + struct.pack("<HHIIHH", 1, ch, sr, byte_rate, ch * sampwidth, sampwidth * 8)
+            + struct.pack(
+                "<HHIIHH", 1, ch, sr, byte_rate, ch * sampwidth, sampwidth * 8
+            )
             + b"data"
             + struct.pack("<I", len(data))
             + data
@@ -351,3 +354,107 @@ def test_read_pcm16_wav_rejects_zero_sample_rate(
 
     monkeypatch.setattr(wave, "open", lambda *_a, **_k: _FakeWave())
     assert Separator._read_pcm16_wav(tmp_path / "zero.wav") is None
+
+
+def test_to_tensor_rejects_wrong_tuple_arity() -> None:
+    """
+    Tuple input must be exactly ``(Tensor, sample_rate)``.
+    """
+    with pytest.raises(ValidationError, match="tuple"):
+        _stub_separator()._to_tensor((torch.zeros(1, 10), 44100, "extra"))
+
+
+def test_to_tensor_rejects_non_tensor_waveform() -> None:
+    """
+    A non-Tensor waveform in the tuple raises ``ValidationError`` instead of
+    an ``AttributeError`` deep in shape handling.
+    """
+    with pytest.raises(ValidationError, match="Tensor"):
+        _stub_separator()._to_tensor(([0.0] * 10, 44100))
+
+
+def test_to_tensor_rejects_bad_sample_rate() -> None:
+    """
+    Non-integer and non-positive sample rates are rejected up front rather
+    than surfacing as cryptic resample errors.
+    """
+    for bad in (0, -1, 44100.5, "44100", True):
+        with pytest.raises(ValidationError, match="[Ss]ample rate"):
+            _stub_separator()._to_tensor((torch.zeros(1, 10), bad))
+
+
+def test_to_tensor_accepts_int_like_sample_rates() -> None:
+    """
+    NumPy integers and whole floats — common outputs of numpy-based audio
+    loaders — are accepted like plain ints (regression: strict
+    ``isinstance(int)`` used to reject them).
+    """
+    sep = _stub_separator()
+    sep.sample_rate = 44100
+    sep.audio_channels = 1
+    for sr in (np.int64(44100), np.int32(44100), 44100.0):
+        wav = sep._to_tensor((torch.zeros(1, 10), sr))
+        assert wav.shape == (1, 10)
+
+
+def test_to_tensor_url_input_reaches_decoder() -> None:
+    """
+    URL strings must reach torchcodec (which supports them) instead of being
+    rejected by the local-file existence pre-check.
+    """
+    with pytest.raises(LoadAudioError) as excinfo:
+        _stub_separator()._to_tensor("notaproto://example.com/track.mp3")
+    assert "File not found" not in str(excinfo.value)
+
+
+def test_to_tensor_missing_file_message() -> None:
+    """
+    A nonexistent path reports "File not found", not a misleading hint about
+    unsupported formats.
+    """
+    with pytest.raises(LoadAudioError, match="File not found"):
+        _stub_separator()._to_tensor("/definitely/not/here.wav")
+
+
+def test_is_url_classification(tmp_path: object) -> None:
+    """
+    Table-driven contract for ``_is_url``: substring match (chained FFmpeg
+    protocols route as URLs), existing local files always win, ``Path``
+    inputs are never URLs.
+    """
+    from pathlib import Path as _P
+
+    from demucs.api import _is_url
+
+    existing = tmp_path / "dir:"  # type: ignore[operator]
+    existing.mkdir()
+    (existing / "take.wav").write_bytes(b"x")
+
+    cases = [
+        ("https://example.com/song.mp3", True),
+        ("cache:https://example.com/song.mp3", True),  # chained protocol
+        ("notaproto://example.com/a.mp3", True),
+        ("downloads/https://x.mp3", True),  # nonexistent, contains ://
+        (f"{existing}//take.wav", False),  # existing local file wins
+        ("plain/local/file.wav", False),
+        (_P("https://example.com/song.mp3"), False),  # Path is never a URL
+    ]
+    for audio, expected in cases:
+        assert _is_url(audio) is expected, audio
+
+
+def test_separate_rejects_bool_numeric_params() -> None:
+    """
+    bool is an int subclass — every numeric ``separate()`` parameter must
+    reject it explicitly rather than silently coercing.
+    """
+    sep = _stub_separator()
+    for kwargs in (
+        {"shifts": True},
+        {"shifts": False},
+        {"chunk_batch_size": True},
+        {"seed": True},
+        {"split_overlap": False},
+    ):
+        with pytest.raises(ValidationError):
+            sep.separate(audio=b"", **kwargs)

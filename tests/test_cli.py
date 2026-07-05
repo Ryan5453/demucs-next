@@ -6,12 +6,14 @@ download, and the format probe runs before model resolution.
 
 from pathlib import Path
 
+import pytest
 import torch
 from click.testing import Result
 from torchcodec.encoders import AudioEncoder
 from typer.testing import CliRunner
 
 from demucs.cli import build_app
+from demucs.repo import ModelRepository
 
 runner = CliRunner()
 
@@ -128,3 +130,26 @@ def test_models_remove_all_with_names_rejected() -> None:
     result = _invoke(["models", "remove", "--all", "htdemucs"])
     assert result.exit_code == 1
     assert "mutually exclusive" in result.output
+
+
+def test_models_remove_all_sweeps_partial_and_temp_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    ``models remove --all`` removes partially-cached models (e.g. an
+    interrupted multi-layer download) and leftover download temp files,
+    not just fully-cached models.
+    """
+    monkeypatch.setenv("DEMUCS_CACHE_DIR", str(tmp_path))
+    # One layer of the multi-layer ensemble = a genuinely partial cache.
+    checksum = ModelRepository().list_models()["htdemucs_ft"]["models"][0]["checksum"]
+    partial_layer = tmp_path / f"{checksum}.th"
+    stale_tmp = tmp_path / "tmpq1w2e3.th"
+    partial_layer.write_bytes(b"x")
+    stale_tmp.write_bytes(b"y")
+
+    result = _invoke(["models", "remove", "--all"])
+
+    assert result.exit_code == 0
+    assert not partial_layer.exists()
+    assert not stale_tmp.exists()

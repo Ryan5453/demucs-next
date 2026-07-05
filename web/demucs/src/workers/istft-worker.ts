@@ -5,8 +5,8 @@
  * blocking the main thread.
  */
 
-import { computeISTFT, createISTFTBuffers, type ISTFTBuffers } from '../audio-processor';
-import { NFFT, HOP_LENGTH, SEGMENT_SAMPLES, createSplitWeight } from '../constants';
+import { computeISTFT, createISTFTBuffers, type ISTFTBuffers } from '../audio-processor.js';
+import { NFFT, HOP_LENGTH, SEGMENT_SAMPLES, createSplitWeight } from '../constants.js';
 
 let istftBuffers: ISTFTBuffers | null = null;
 const splitWeight = createSplitWeight();

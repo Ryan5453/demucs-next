@@ -153,7 +153,7 @@ The routing is:
 
 Demucs provides a `ModelRepository` class to more deeply control the model loading process. This is used internally by the `Separator` class but can be used directly to load models manually to then pass to Separator itself.
 
-`ModelRepository` is initialized with no parameters. (i.e. `repo = ModelRepository()`)
+`ModelRepository` is initialized with no required parameters. (i.e. `repo = ModelRepository()`)
 
 ### get_cache_info
 
@@ -161,18 +161,20 @@ Demucs provides a `ModelRepository` class to more deeply control the model loadi
 def get_cache_info(self) -> dict[str, dict]:
 ```
 
-This will return a dictionary of information about the cached models.
+This will return a dictionary of information about the cached models. Models with at least one cached layer are included, so a partially-downloaded model shows up with `"complete": False`.
 
 ```python
 {
     "model_name": {
-        "layers": {       # A dictionary mapping layer checksums to their cache information
+        "layers": {       # A dictionary mapping cached layer checksums to their cache information
             "checksum": {
                 "path": str,       # Path to the cached layer file
                 "size_bytes": int, # Size of the layer in bytes
             }
         },
-        "size_bytes": int, # Total size of the model in bytes
+        "size_bytes": int,  # Total size of the cached layers in bytes
+        "total_layers": int, # Number of layers the model has in metadata
+        "complete": bool,    # True when every layer is cached
     },
     ...
 }
@@ -216,7 +218,7 @@ This will return a dictionary of all available models.
 def remove_model(self, name: str) -> bool:
 ```
 
-Pass in the name of the model you would like to remove and it will remove the weights from the filesystem.
+Pass in the name of the model you would like to remove and it will remove the weights from the filesystem. Returns `True` if anything was removed, `False` for an unknown model or an empty cache; raises `ModelLoadingError` if a cached layer can't be removed (e.g. permissions).
 
 ### get_cache_dir
 
@@ -228,7 +230,7 @@ from demucs.repo import get_cache_dir
 def get_cache_dir() -> Path:
 ```
 
-This will return the directory where the models are cached. This path is fully resolved.
+This will return the directory where the models are cached (created on first download). Set the `DEMUCS_CACHE_DIR` environment variable to relocate it (default: `~/.demucs/models`); the value is tilde-expanded and resolved.
 
 ## Progress Callbacks
 
@@ -346,6 +348,14 @@ def default_device() -> str:
 ```
 
 Returns `"cuda"`, `"mps"`, or `"cpu"`, whichever is available — the same selection `Separator(device=None)` uses.
+
+```python
+from demucs import default_dtype
+
+def default_dtype(device: str) -> torch.dtype | None:
+```
+
+Returns the inference dtype `dtype="auto"` picks for a device (`torch.float16` on MPS and CUDA with tensor cores; `None`, meaning FP32, on CPU and older CUDA GPUs). Raises `ValidationError` for other device strings, or for `"cuda"` without CUDA available.
 
 ### Exceptions
 
