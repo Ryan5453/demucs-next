@@ -62,7 +62,6 @@ export function Home() {
     const fileInputRef = useRef<HTMLInputElement>(null);
     const [phase, setPhase] = useState<Phase>('drop');
     const [isDragging, setIsDragging] = useState(false);
-    const [isHovering, setIsHovering] = useState(false);
     // Drag enter/leave events fire for every child element; track depth so
     // the drag state only clears when the pointer truly leaves the page.
     const dragDepth = useRef(0);
@@ -455,10 +454,8 @@ export function Home() {
                     <div
                         className={`drop-stage${isDragging ? ' drag' : ''}`}
                         onClick={() => fileInputRef.current?.click()}
-                        onMouseEnter={() => setIsHovering(true)}
-                        onMouseLeave={() => setIsHovering(false)}
                     >
-                        <Braid active={isDragging || isHovering} />
+                        <Braid active={isDragging} />
                         <div className="drop-caption">
                             <div className="t">Drop a song anywhere</div>
                             <div className="s">MP3 · WAV · FLAC · OGG</div>

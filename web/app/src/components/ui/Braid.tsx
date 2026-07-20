@@ -136,6 +136,9 @@ export function Braid({ active = false, progress, audioBuffer = null }: BraidPro
         let energy = 0;
         const peel = new Float32Array(N);
         let lastT = 0;
+        // Carrier phase is integrated (not speed × t) so speed changes read
+        // as smooth acceleration instead of scrubbing the whole braid.
+        let phase = 21.7;
 
         const drawFrame = (t: number, snap: boolean) => {
             const { active: hot, progress: prog, envelope: env } = live.current;
@@ -165,7 +168,7 @@ export function Braid({ active = false, progress, audioBuffer = null }: BraidPro
             const spread = Math.min(h * 0.36, 132);
             const mul = h / 340;
             const carrierAmp = 36 * mul * (1 + energy * 0.6);
-            const wSpeed = prog !== undefined ? 2.6 : 1.1 + energy * 0.9;
+            phase += (prog !== undefined ? 2.6 : 1.1 + energy * 0.9) * dt;
             const k = (Math.PI * 2 * 3.2) / Math.max(1, w);
             const step = 2;
             ctx.lineWidth = 1;
@@ -203,7 +206,7 @@ export function Braid({ active = false, progress, audioBuffer = null }: BraidPro
                 ctx.beginPath();
                 for (let x = x0; x <= x1; x += step) {
                     const e = envAt(x);
-                    const carrier = carrierAmp * e * (1 - s) * Math.sin(k * x - wSpeed * t + phi);
+                    const carrier = carrierAmp * e * (1 - s) * Math.sin(k * x - phase + phi);
                     const char = stem.wave(x, t) * charAmp * e;
                     const y = laneY + carrier + char;
                     if (x === x0) ctx.moveTo(x, y);
