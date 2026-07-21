@@ -546,8 +546,22 @@ def separate_command(
         # ``resolve(strict=False)`` collapses dot components and existing
         # symlinked parents; NFC+casefold conservatively catches aliases on
         # normalization/case-insensitive filesystems before inference starts.
+        # Python 3.13 stopped raising for symlink loops in non-strict mode, so
+        # probe in strict mode first. A missing output is expected; other
+        # resolution failures (including ELOOP) must still abort before inference.
+        path = Path(planned)
         try:
-            resolved = str(Path(planned).resolve(strict=False))
+            path.resolve(strict=True)
+        except FileNotFoundError:
+            pass
+        except (OSError, RuntimeError) as exc:
+            console.print(
+                "[red]✗[/red] Could not resolve planned output path "
+                f"'{escape(planned)}': {escape(str(exc))}"
+            )
+            raise typer.Exit(1) from exc
+        try:
+            resolved = str(path.resolve(strict=False))
         except (OSError, RuntimeError) as exc:
             console.print(
                 "[red]✗[/red] Could not resolve planned output path "
