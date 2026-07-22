@@ -1,6 +1,6 @@
 # unblend
 
-`unblend` is a music source separation library with one `Separator` API over multiple model families: an optimized fork of [Demucs](https://github.com/adefossez/demucs), plus BS-RoFormer and Mel-Band RoFormer community checkpoints (`bs_roformer_sw`, `melband_roformer_kim`). The Demucs backend runs ~2.5× faster than upstream like-for-like (FP32), up to ~6× with FP16 + `torch.compile`; single-stem specialist loading reaches 19–23× by skipping unused models. Registered model weights are pickle-free Safetensors; architecture/configuration is allowlisted in `metadata.json`, and exact size plus SHA-256 are checked before loading. Run `unblend models list` for stems and weight licenses (RoFormer weights are CC-BY-NC-SA-4.0, non-commercial; Demucs weights carry no license grant).
+`unblend` is a music source separation library with one `Separator` API over multiple model families: an optimized implementation of [HTDemucs](https://github.com/adefossez/demucs), plus BS-RoFormer and Mel-Band RoFormer community checkpoints (`bs_roformer_sw`, `melband_roformer_kim`). The Demucs backend runs ~2.5× faster than upstream like-for-like (FP32), up to ~6× with FP16 + `torch.compile`. When extracting single stems, unblend is 19–23x faster.
 
 
 <details>
@@ -76,25 +76,9 @@ Peak process RSS, htdemucs_ft: 3.3 GB vs 4.6 GB for the reference. Compiled ense
 
 ### Prerequisites
 
-Before installing unblend, make sure your system has:
-
 - FFmpeg v4+ available in your `PATH`
 - [`uv`](https://docs.astral.sh/uv/#installation)
-- Optionally, a working C/C++ compiler such as `g++` for CUDA compilation (the CLI enables it automatically only for workloads past the estimated break-even point; failures fall back to eager, and `--no-compile` disables it)
-
-### Temporary Installation using UV
-
-With UV, you can use the `uvx` command to run unblend without installing it permanently on your system. This sets up a temporary virtual environment for the duration of the command.
-
-```bash
-uvx unblend separate audio_file.mp3
-```
-
-The PyPI package and the CLI command are both named `unblend`, so no `--from` mapping is needed. (A `demucs` command alias is also installed for compatibility with the former name.)
-
-`unblend` installs the `unblend` module and command, plus `demucs` and `demucs-inference` command aliases for compatibility with the former name. The module no longer clashes with the original `demucs` package, but the `demucs` command alias does — keep them in separate environments if you need both.
-
-**Note**: unblend does not specify a specific PyTorch wheel. This means that GPUs will only work on Apple Silicon or PyTorch's default CUDA version (currently 12.8) on Linux when using uvx. unblend will fall back to CPU if one of the above conditions are not met. (This uvx default is independent of the Cog/Replicate build, which pins CUDA 12.4 in `cog.yaml`.)
+- C/C++ compiler such as GCC, Clang, or MSVC
 
 ### Install using UV
 
@@ -116,6 +100,17 @@ uv pip install unblend --torch-backend=auto
 
 The `--torch-backend=auto` flag automatically detects your GPU and installs the appropriate version of PyTorch compatible with your system.
 
+### Temporary Installation
+
+With UV, you can use the `uvx` command to run unblend without installing it permanently on your system. This sets up a temporary virtual environment for the duration of the command.
+
+```bash
+uvx unblend separate audio_file.mp3
+```
+
+**Note**: unblend does not specify a specific PyTorch wheel. This means that GPUs will only work on Apple Silicon or PyTorch's default CUDA version (currently 12.8) on Linux when using uvx. unblend will fall back to CPU if one of the above conditions are not met. (This uvx default is independent of the Cog/Replicate build, which pins CUDA 12.4 in `cog.yaml`.)
+
+
 ## CLI Usage
 
 After installing unblend, you can use it like the following:
@@ -130,8 +125,7 @@ unblend separate audio_file.mp3
 # Separate multiple audio files
 unblend separate audio_file_1.mp3 audio_file_2.mp3
 
-# Separate every audio file in a directory tree (recurses into subdirectories;
-# dotfiles and dot-directories are skipped).
+# Separate every audio file in a directory tree (recurses into subdirectories - dotfiles and dot-directories are skipped).
 unblend separate /path/to/music/folder
 ```
 
@@ -145,8 +139,4 @@ unblend can also run in the browser via ONNX. See the [ONNX export notes](https:
 
 ## Cog Usage
 
-unblend provides a [Cog](https://github.com/replicate/cog), which allows you to easily deploy it as a REST API. You can alternatively use the hosted version at [Replicate](https://replicate.com/ryan5453/demucs).
-
-## Changelog
-
-The [changelog](https://github.com/Ryan5453/unblend/blob/main/changelog.md) contains information about the changes between versions of unblend.
+unblend provides a [Cog](https://github.com/replicate/cog) for HTDemucs which allows you to easily deploy it as a REST API. You can alternatively use the hosted version at [Replicate](https://replicate.com/ryan5453/demucs).
