@@ -194,3 +194,5 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+web/app/public/*.onnx

@@ -698,6 +698,11 @@ input[type=range]::-moz-range-thumb {
   color: var(--dim);
 }
 
+.content-notice {
+  padding-top: 1rem;
+  border-top: 1px solid var(--paper2);
+}
+
 /* ========================================
    Error modal
    ======================================== */
